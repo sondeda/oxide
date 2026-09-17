@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <string>
 #include <thread>
+#include <fstream>
 #include <cstring>
 #include "zygisk.hpp"
 
