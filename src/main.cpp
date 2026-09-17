@@ -43,7 +43,7 @@ template<typename T> struct Il2CppList {
 };
 
 static bool load_il2cpp() {
-    void* h = dlopen("/data/app/~~_NthGXSYS_U0l4s9w1s57g==/com.catsbit.oxidesurvivalisland-bT7-xLtSAW6BuiuElJXNMw==/lib/arm64/libil2cpp.so", RTLD_NOW|RTLD_NOLOAD);
+    void* h = dlopen("/data/app/~~_NthGXSYS_U0l4s9w1s57g==/com.catsbit.oxidesurvivalisland-bT7-xLtSAW6BuiuElJXNMw==/lib/arm64/libil2cpp.so", RTLD_NOW|RTLD_GLOBAL);
     if (!h) h = dlopen("/data/app/~~_NthGXSYS_U0l4s9w1s57g==/com.catsbit.oxidesurvivalisland-bT7-xLtSAW6BuiuElJXNMw==/lib/arm64/libil2cpp.so", RTLD_NOW);
     if (!h) { LOGE("dlopen failed: %s", dlerror()); return false; }
 #define SYM(fn,name) fn=(decltype(fn))dlsym(h,name); if(!fn){LOGE("dlsym %s failed",name);return false;}
