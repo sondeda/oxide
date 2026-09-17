@@ -42,8 +42,29 @@ template<typename T> struct Il2CppList {
     void* klass; void* monitor; Il2CppArray<T>* items; int32_t size; int32_t version;
 };
 
+static std::string find_il2cpp_path() {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find("libil2cpp.so") != std::string::npos &&
+            line.find("r-xp") != std::string::npos) {
+            auto pos = line.rfind(' ');
+            if (pos != std::string::npos) {
+                std::string p = line.substr(pos + 1);
+                if (!p.empty() && p.back() == '\n') p.pop_back();
+                return p;
+            }
+        }
+    }
+    return "";
+}
+
 static bool load_il2cpp() {
-    void* h = dlopen(nullptr, RTLD_NOW);
+    std::string path = find_il2cpp_path();
+    if (path.empty()) { LOGE("il2cpp not found in maps"); return false; }
+    LOGI("il2cpp: %s", path.c_str());
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+    if (!h) h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (!h) { LOGE("dlopen failed: %s", dlerror()); return false; }
 #define SYM(fn,name) fn=(decltype(fn))dlsym(h,name); if(!fn){LOGE("dlsym %s failed",name);return false;}
     SYM(il2cpp_domain_get,"il2cpp_domain_get")
