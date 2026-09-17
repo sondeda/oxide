@@ -117,12 +117,28 @@ static void* elf_find_symbol(uintptr_t base, const char* sym_name) {
         }
     }
 
-    if (!symtab || !strtab || symcnt == 0) return nullptr;
+    if (!symtab || !strtab) return nullptr;
+
+    // if symcnt from gnu_hash failed, try DT_HASH
+    if (symcnt == 0) {
+        for (auto* d = dyn; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag == DT_HASH) {
+                uint32_t* ht = (uint32_t*)(load_bias + d->d_un.d_ptr);
+                symcnt = ht[1]; // nchain = total symbol count
+                break;
+            }
+        }
+    }
+
+    // fallback: scan until strtab if still 0
+    if (symcnt == 0) symcnt = 65536;
 
     for (size_t i = 0; i < symcnt; i++) {
         auto* sym = (Elf64_Sym*)((uint8_t*)symtab + i * symsz);
         if (sym->st_name == 0 || sym->st_value == 0) continue;
-        if (strcmp(strtab + sym->st_name, sym_name) == 0) {
+        // bounds check strtab access
+        const char* name_ptr = strtab + sym->st_name;
+        if (strcmp(name_ptr, sym_name) == 0) {
             return (void*)(load_bias + sym->st_value);
         }
     }
