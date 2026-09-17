@@ -165,3 +165,5 @@ public:
 };
 
 REGISTER_ZYGISK_MODULE(OxideModule)
+
+extern "C" __attribute__((visibility("default"))) int zygisk_module_abi_version() { return 4; }
