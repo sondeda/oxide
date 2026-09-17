@@ -8,11 +8,15 @@
 #include <thread>
 #include <fstream>
 #include <cstring>
+#include <elf.h>
+#include <link.h>
 #include "zygisk.hpp"
 
 #define TAG "OxideCheat"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// ── function pointer types ────────────────────────────────────────────────────
 
 using fn_domain_get            = void*(*)();
 using fn_thread_attach         = void*(*)(void*);
@@ -34,6 +38,123 @@ static fn_assembly_get_image    il2cpp_assembly_get_image;
 static fn_domain_get_assemblies il2cpp_domain_get_assemblies;
 static fn_image_get_name        il2cpp_image_get_name;
 
+// ── ELF symbol resolver ───────────────────────────────────────────────────────
+// Finds a symbol in a loaded ELF by scanning its dynamic symbol table directly
+// Works even when symbols are hidden from dlsym
+
+static uintptr_t find_lib_base(const char* libname) {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find(libname) == std::string::npos) continue;
+        if (line.find("r--p") == std::string::npos &&
+            line.find("r-xp") == std::string::npos) continue;
+        // parse start address
+        uintptr_t start = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
+        // verify ELF magic
+        if (*(uint32_t*)start == 0x464C457F) return start;
+    }
+    return 0;
+}
+
+static void* elf_find_symbol(uintptr_t base, const char* sym_name) {
+    auto* ehdr = (Elf64_Ehdr*)base;
+    if (ehdr->e_ident[0] != 0x7F) return nullptr;
+
+    auto* phdr = (Elf64_Phdr*)(base + ehdr->e_phoff);
+    uintptr_t load_bias = 0;
+
+    // find load bias
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD && phdr[i].p_offset == 0) {
+            load_bias = base - phdr[i].p_vaddr;
+            break;
+        }
+    }
+
+    // find dynamic segment
+    Elf64_Dyn* dyn = nullptr;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (Elf64_Dyn*)(load_bias + phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return nullptr;
+
+    Elf64_Sym*  symtab  = nullptr;
+    const char* strtab  = nullptr;
+    size_t      symsz   = sizeof(Elf64_Sym);
+    size_t      symcnt  = 0;
+
+    for (auto* d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_SYMTAB:  symtab = (Elf64_Sym*)(load_bias + d->d_un.d_ptr); break;
+            case DT_STRTAB:  strtab = (const char*)(load_bias + d->d_un.d_ptr); break;
+            case DT_SYMENT:  symsz  = d->d_un.d_val; break;
+            case DT_GNU_HASH: {
+                // count symbols via gnu hash
+                uint32_t* gh = (uint32_t*)(load_bias + d->d_un.d_ptr);
+                uint32_t nbuckets = gh[0];
+                uint32_t symoffset = gh[1];
+                uint32_t bloom_size = gh[2];
+                uint32_t* buckets = gh + 4 + (bloom_size * 2);
+                uint32_t* chains = buckets + nbuckets;
+                uint32_t max_sym = symoffset;
+                for (uint32_t b = 0; b < nbuckets; b++) {
+                    if (buckets[b] == 0) continue;
+                    uint32_t idx = buckets[b];
+                    while (true) {
+                        if (idx > max_sym) max_sym = idx;
+                        if (chains[idx - symoffset] & 1) break;
+                        idx++;
+                    }
+                }
+                symcnt = max_sym + 1;
+                break;
+            }
+            default: break;
+        }
+    }
+
+    if (!symtab || !strtab || symcnt == 0) return nullptr;
+
+    for (size_t i = 0; i < symcnt; i++) {
+        auto* sym = (Elf64_Sym*)((uint8_t*)symtab + i * symsz);
+        if (sym->st_name == 0 || sym->st_value == 0) continue;
+        if (strcmp(strtab + sym->st_name, sym_name) == 0) {
+            return (void*)(load_bias + sym->st_value);
+        }
+    }
+    return nullptr;
+}
+
+static bool load_il2cpp() {
+    uintptr_t base = find_lib_base("libil2cpp.so");
+    if (!base) { LOGE("libil2cpp.so not found in maps"); return false; }
+    LOGI("il2cpp base: 0x%lx", base);
+
+#define SYM(fn, name) \
+    fn = (decltype(fn))elf_find_symbol(base, name); \
+    if (!fn) { LOGE("symbol not found: %s", name); return false; } \
+    LOGI("found %s @ %p", name, (void*)fn);
+
+    SYM(il2cpp_domain_get,            "il2cpp_domain_get")
+    SYM(il2cpp_thread_attach,         "il2cpp_thread_attach")
+    SYM(il2cpp_class_from_name,       "il2cpp_class_from_name")
+    SYM(il2cpp_class_get_field_from_name, "il2cpp_class_get_field_from_name")
+    SYM(il2cpp_field_static_get_value,"il2cpp_field_static_get_value")
+    SYM(il2cpp_field_get_value,       "il2cpp_field_get_value")
+    SYM(il2cpp_assembly_get_image,    "il2cpp_assembly_get_image")
+    SYM(il2cpp_domain_get_assemblies, "il2cpp_domain_get_assemblies")
+    SYM(il2cpp_image_get_name,        "il2cpp_image_get_name")
+#undef SYM
+
+    return true;
+}
+
+// ── IL2CPP containers ─────────────────────────────────────────────────────────
+
 struct Vec3 { float x,y,z; };
 
 template<typename T> struct Il2CppArray {
@@ -43,146 +164,118 @@ template<typename T> struct Il2CppList {
     void* klass; void* monitor; Il2CppArray<T>* items; int32_t size; int32_t version;
 };
 
-static std::string find_il2cpp_path() {
-    std::ifstream maps("/proc/self/maps");
-    std::string line;
-    while (std::getline(maps, line)) {
-        if (line.find("libil2cpp.so") != std::string::npos &&
-            line.find("r-xp") != std::string::npos) {
-            auto pos = line.rfind(' ');
-            if (pos != std::string::npos) {
-                std::string p = line.substr(pos + 1);
-                if (!p.empty() && p.back() == '\n') p.pop_back();
-                return p;
-            }
-        }
-    }
-    return "";
-}
-
-static bool load_il2cpp() {
-    std::string path = find_il2cpp_path();
-    if (path.empty()) { LOGE("il2cpp not found in maps"); return false; }
-    LOGI("il2cpp: %s", path.c_str());
-    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
-    if (!h) h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-    if (!h) { LOGE("dlopen failed: %s", dlerror()); return false; }
-#define SYM(fn,name) fn=(decltype(fn))dlsym(h,name); if(!fn){LOGE("dlsym %s failed",name);return false;}
-    SYM(il2cpp_domain_get,"il2cpp_domain_get")
-    SYM(il2cpp_thread_attach,"il2cpp_thread_attach")
-    SYM(il2cpp_class_from_name,"il2cpp_class_from_name")
-    SYM(il2cpp_class_get_field_from_name,"il2cpp_class_get_field_from_name")
-    SYM(il2cpp_field_static_get_value,"il2cpp_field_static_get_value")
-    SYM(il2cpp_field_get_value,"il2cpp_field_get_value")
-    SYM(il2cpp_assembly_get_image,"il2cpp_assembly_get_image")
-    SYM(il2cpp_domain_get_assemblies,"il2cpp_domain_get_assemblies")
-    SYM(il2cpp_image_get_name,"il2cpp_image_get_name")
-#undef SYM
-    return true;
-}
+// ── image finder ─────────────────────────────────────────────────────────────
 
 static void* find_image(void* domain) {
-    size_t count=0;
-    void** assemblies=(void**)il2cpp_domain_get_assemblies(domain,&count);
-    if(!assemblies) return nullptr;
-    for(size_t i=0;i<count;i++){
-        void* img=il2cpp_assembly_get_image(assemblies[i]);
-        if(!img) continue;
-        const char* name=il2cpp_image_get_name(img);
-        if(name && strstr(name,"Assembly-CSharp.dll") && !strstr(name,"firstpass"))
+    size_t count = 0;
+    void** assemblies = (void**)il2cpp_domain_get_assemblies(domain, &count);
+    if (!assemblies) return nullptr;
+    for (size_t i = 0; i < count; i++) {
+        void* img = il2cpp_assembly_get_image(assemblies[i]);
+        if (!img) continue;
+        const char* name = il2cpp_image_get_name(img);
+        if (name && strstr(name,"Assembly-CSharp.dll") && !strstr(name,"firstpass"))
             return img;
     }
     return nullptr;
 }
 
-static void esp_tick(void* img) {
-    static void* klass_pm=nullptr;
-    static void* f_apl=nullptr;
-    static void* f_vitals=nullptr;
-    static void* f_peh=nullptr;
-    static bool resolved=false;
+// ── ESP ───────────────────────────────────────────────────────────────────────
 
-    if(!resolved){
-        klass_pm=il2cpp_class_from_name(img,"","PlayerManager");
-        if(!klass_pm) return;
-        f_apl    =il2cpp_class_get_field_from_name(klass_pm,"activePlayerList");
-        f_vitals =il2cpp_class_get_field_from_name(klass_pm,"vitals");
-        f_peh    =il2cpp_class_get_field_from_name(klass_pm,"playerEventHandler");
-        if(!f_apl) return;
-        resolved=true;
+static void esp_tick(void* img) {
+    static void* klass_pm = nullptr;
+    static void* f_apl    = nullptr;
+    static void* f_vitals = nullptr;
+    static void* f_peh    = nullptr;
+    static bool  resolved = false;
+
+    if (!resolved) {
+        klass_pm = il2cpp_class_from_name(img, "", "PlayerManager");
+        if (!klass_pm) return;
+        f_apl    = il2cpp_class_get_field_from_name(klass_pm, "activePlayerList");
+        f_vitals = il2cpp_class_get_field_from_name(klass_pm, "vitals");
+        f_peh    = il2cpp_class_get_field_from_name(klass_pm, "playerEventHandler");
+        if (!f_apl) return;
+        resolved = true;
         LOGI("ESP ready");
     }
 
-    void* mb=nullptr;
-    il2cpp_field_static_get_value(f_apl,&mb);
-    if(!mb) return;
+    void* mb = nullptr;
+    il2cpp_field_static_get_value(f_apl, &mb);
+    if (!mb) return;
 
-    auto* list=*(Il2CppList<void*>**)((uintptr_t)mb+0x10);
-    if(!list||!list->items) return;
-    int count=(int)list->size;
-    if(count<=0||count>64) return;
+    auto* list = *(Il2CppList<void*>**)((uintptr_t)mb + 0x10);
+    if (!list || !list->items) return;
+    int count = (int)list->size;
+    if (count <= 0 || count > 64) return;
 
-    for(int i=0;i<count;i++){
-        void* pm=list->items->m_Items[i];
-        if(!pm) continue;
+    for (int i = 0; i < count; i++) {
+        void* pm = list->items->m_Items[i];
+        if (!pm) continue;
         Vec3 pos{};
-        if(f_peh){
-            void* peh=nullptr;
-            il2cpp_field_get_value(pm,f_peh,&peh);
-            if(peh){
-                void* tr=*(void**)((uintptr_t)peh+0x10);
-                if(tr) pos=*(Vec3*)((uintptr_t)tr+0x90);
+        if (f_peh) {
+            void* peh = nullptr;
+            il2cpp_field_get_value(pm, f_peh, &peh);
+            if (peh) {
+                void* tr = *(void**)((uintptr_t)peh + 0x10);
+                if (tr) pos = *(Vec3*)((uintptr_t)tr + 0x90);
             }
         }
-        float hp=0.f;
-        if(f_vitals){
-            void* v=nullptr;
-            il2cpp_field_get_value(pm,f_vitals,&v);
-            if(v){
-                void* hg=*(void**)((uintptr_t)v+0x98);
-                if(hg) hp=*(float*)((uintptr_t)hg+0x18);
+        float hp = 0.f;
+        if (f_vitals) {
+            void* v = nullptr;
+            il2cpp_field_get_value(pm, f_vitals, &v);
+            if (v) {
+                void* hg = *(void**)((uintptr_t)v + 0x98);
+                if (hg) hp = *(float*)((uintptr_t)hg + 0x18);
             }
         }
-        __android_log_print(ANDROID_LOG_INFO,"OxideESP",
-            "[%d] pos=(%.1f,%.1f,%.1f) hp=%.0f",i,pos.x,pos.y,pos.z,hp);
+        __android_log_print(ANDROID_LOG_INFO, "OxideESP",
+            "[%d] pos=(%.1f,%.1f,%.1f) hp=%.0f", i, pos.x, pos.y, pos.z, hp);
     }
 }
 
-static void cheat_main(){
+// ── cheat thread ──────────────────────────────────────────────────────────────
+
+static void cheat_main() {
     sleep(5);
     LOGI("Starting");
-    if(!load_il2cpp()) return;
-    void* domain=il2cpp_domain_get();
-    if(!domain) return;
+    if (!load_il2cpp()) return;
+    void* domain = il2cpp_domain_get();
+    if (!domain) { LOGE("domain null"); return; }
     il2cpp_thread_attach(domain);
-    void* img=find_image(domain);
-    if(!img){ LOGE("Assembly-CSharp not found"); return; }
+    void* img = find_image(domain);
+    if (!img) { LOGE("Assembly-CSharp not found"); return; }
     LOGI("IL2CPP ready — loop start");
-    while(true){ sleep(1); esp_tick(img); }
+    while (true) { sleep(1); esp_tick(img); }
 }
 
+// ── Zygisk ────────────────────────────────────────────────────────────────────
+
 class OxideModule : public zygisk::ModuleBase {
-    zygisk::Api* api_=nullptr;
-    JNIEnv* env_=nullptr;
-    bool target_=false;
+    zygisk::Api* api_ = nullptr;
+    JNIEnv*      env_ = nullptr;
+    bool         target_ = false;
 public:
-    void onLoad(zygisk::Api* api, JNIEnv* env) override { api_=api; env_=env; }
+    void onLoad(zygisk::Api* api, JNIEnv* env) override { api_ = api; env_ = env; }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
-        if(!args->nice_name){ api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY); return; }
-        const char* pkg=env_->GetStringUTFChars(args->nice_name,nullptr);
-        if(pkg){
-            if(strstr(pkg,"catsbit")||strstr(pkg,"oxidesurvival")) target_=true;
-            env_->ReleaseStringUTFChars(args->nice_name,pkg);
+        if (!args->nice_name) { api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY); return; }
+        const char* pkg = env_->GetStringUTFChars(args->nice_name, nullptr);
+        if (pkg) {
+            if (strstr(pkg,"catsbit") || strstr(pkg,"oxidesurvival")) target_ = true;
+            env_->ReleaseStringUTFChars(args->nice_name, pkg);
         }
-        if(!target_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        if (!target_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
-        if(!target_) return;
+        if (!target_) return;
         LOGI("Injected — launching cheat");
         std::thread(cheat_main).detach();
     }
 };
 
 REGISTER_ZYGISK_MODULE(OxideModule)
+
+extern "C" __attribute__((visibility("default"))) int zygisk_module_abi_version() { return 4; }
