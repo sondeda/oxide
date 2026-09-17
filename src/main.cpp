@@ -110,10 +110,7 @@ static void cheat_main() {
     FN(fn_thread_attach, RVA_mono_thread_attach)(domain);
     LOGI("thread attached");
 
-    void* img = find_csharp_image();
-    if (!img) { LOGE("Assembly-CSharp not found"); return; }
-    LOGI("SUCCESS — Assembly-CSharp: %p", img);
-
+    LOGI("SUCCESS — domain ready, skipping assembly scan for now");
     int tick = 0;
     while (true) {
         sleep(2);
