@@ -18,6 +18,7 @@
 
 // ── function pointer types ────────────────────────────────────────────────────
 
+// Mono API
 using fn_domain_get            = void*(*)();
 using fn_thread_attach         = void*(*)(void*);
 using fn_class_from_name       = void*(*)(void*,const char*,const char*);
@@ -25,8 +26,9 @@ using fn_field_from_name       = void*(*)(void*,const char*);
 using fn_field_static_get      = void(*)(void*,void*);
 using fn_field_get             = void(*)(void*,void*,void*);
 using fn_assembly_get_image    = void*(*)(void*);
-using fn_domain_get_assemblies = void*(*)(void*,size_t*);
+using fn_domain_get_assemblies = void*(*)(void*,int*);
 using fn_image_get_name        = const char*(*)(void*);
+using fn_thread_current        = void*(*)();
 
 static fn_domain_get            il2cpp_domain_get;
 static fn_thread_attach         il2cpp_thread_attach;
@@ -155,15 +157,15 @@ static bool load_il2cpp() {
     if (!fn) { LOGE("symbol not found: %s", name); return false; } \
     LOGI("found %s @ %p", name, (void*)fn);
 
-    SYM(il2cpp_domain_get,            "il2cpp_domain_get")
-    SYM(il2cpp_thread_attach,         "il2cpp_thread_attach")
-    SYM(il2cpp_class_from_name,       "il2cpp_class_from_name")
-    SYM(il2cpp_class_get_field_from_name, "il2cpp_class_get_field_from_name")
-    SYM(il2cpp_field_static_get_value,"il2cpp_field_static_get_value")
-    SYM(il2cpp_field_get_value,       "il2cpp_field_get_value")
-    SYM(il2cpp_assembly_get_image,    "il2cpp_assembly_get_image")
-    SYM(il2cpp_domain_get_assemblies, "il2cpp_domain_get_assemblies")
-    SYM(il2cpp_image_get_name,        "il2cpp_image_get_name")
+    SYM(il2cpp_domain_get,            "mono_domain_get")
+    SYM(il2cpp_thread_attach,         "mono_thread_attach")
+    SYM(il2cpp_class_from_name,       "mono_class_from_name")
+    SYM(il2cpp_class_get_field_from_name, "mono_class_get_field_from_name")
+    SYM(il2cpp_field_static_get_value,"mono_field_static_get_value")
+    SYM(il2cpp_field_get_value,       "mono_field_get_value")
+    SYM(il2cpp_assembly_get_image,    "mono_assembly_get_image")
+    SYM(il2cpp_domain_get_assemblies, "mono_domain_get_assemblies_iter")
+    SYM(il2cpp_image_get_name,        "mono_image_get_name")
 #undef SYM
 
     return true;
@@ -183,14 +185,23 @@ template<typename T> struct Il2CppList {
 // ── image finder ─────────────────────────────────────────────────────────────
 
 static void* find_image(void* domain) {
-    size_t count = 0;
-    void** assemblies = (void**)il2cpp_domain_get_assemblies(domain, &count);
-    if (!assemblies) return nullptr;
-    for (size_t i = 0; i < count; i++) {
-        void* img = il2cpp_assembly_get_image(assemblies[i]);
+    // mono_domain_get_assemblies_iter: iter-based, pass NULL to start
+    void* iter = nullptr;
+    void* assembly = nullptr;
+    // fallback: use mono_domain_assembly_open or iterate known name
+    // Use offset-based approach: domain->domain_assemblies is a list
+    // For simplicity scan first 512 pointers after domain for Assembly-CSharp
+    // Better: call mono_domain_get_assemblies_iter with iterator
+    using fn_iter = void*(*)(void*, void**);
+    fn_iter iter_fn = (fn_iter)il2cpp_domain_get_assemblies;
+    void* it = nullptr;
+    for (int i = 0; i < 256; i++) {
+        void* asm_ptr = iter_fn(domain, &it);
+        if (!asm_ptr) break;
+        void* img = il2cpp_assembly_get_image(asm_ptr);
         if (!img) continue;
         const char* name = il2cpp_image_get_name(img);
-        if (name && strstr(name,"Assembly-CSharp.dll") && !strstr(name,"firstpass"))
+        if (name && strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
             return img;
     }
     return nullptr;
