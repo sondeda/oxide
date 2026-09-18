@@ -59,7 +59,7 @@ static void* read_root_domain_var(void* h) {
     
     // Follow B (branch) instruction if present
     uintptr_t cur = (uintptr_t)fn_ptr;
-    for (int depth = 0; depth < 4; depth++) {
+    for (int depth = 0; depth < 32; depth++) {
         uint32_t in0 = 0, in1 = 0;
         memcpy(&in0, (void*)cur, 4);
         memcpy(&in1, (void*)(cur+4), 4);
@@ -100,8 +100,10 @@ static void* read_root_domain_var(void* h) {
         }
         // RET
         if (in0 == 0xD65F03C0) { LOGE("RET without finding var"); return nullptr; }
-        LOGE("unhandled insn 0x%08x at 0x%lx", in0, cur);
-        return nullptr;
+        // Skip unknown instructions (prologue, STP, MOV etc) — scan forward
+        LOGI("skip insn 0x%08x @ 0x%lx", in0, cur);
+        cur += 4;
+        continue;
     }
     LOGE("too many branches");
     return nullptr;
