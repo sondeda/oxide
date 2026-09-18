@@ -476,8 +476,20 @@ static float text_width(const char* text, float scale) {
 static void render_esp() {
     if (!g_menu.esp_enabled) return;
 
+    // Ждём 120 фреймов после инжекта перед рендером ESP
+    // чтобы игра полностью инициализировалась
+    static int frame_delay = 0;
+    if (frame_delay < 120) { frame_delay++; return; }
+
+    // Проверяем что функции камеры инициализированы
+    if (!g_cam_getmain || !g_cam_w2s) return;
+
     void* cam = g_cam_getmain(nullptr);
     if (!cam) return;
+
+    // Дополнительная проверка валидности объекта камеры
+    void* cam_klass = *(void**)cam;
+    if (!safe_ptr(cam_klass)) return;
 
     std::vector<void*> players_copy;
     void* local_copy;
@@ -497,6 +509,10 @@ static void render_esp() {
     for (void* pm : players_copy) {
         if (!pm || !safe_ptr(pm)) continue;
         if (pm == local_copy) continue;
+
+        // Проверяем что объект ещё жив — klass pointer должен быть валидным
+        void* klass_ptr = *(void**)pm;
+        if (!safe_ptr(klass_ptr)) continue;
 
         PlayerInfo pi = snapshot_player(pm);
 
@@ -799,10 +815,20 @@ static std::vector<std::string> find_touch_devices() {
 
 static void touch_reader_thread() {
     // ждём пока игра поднимется
-    sleep(6);
+    sleep(8);
 
     auto devices = find_touch_devices();
-    if (devices.empty()) { LOGE("no touch devices found"); return; }
+    if (devices.empty()) {
+        LOGE("no touch devices found — меню через /data/local/tmp/.bobadlc_menu");
+        // Fallback: файловый триггер если /dev/input недоступен
+        while (true) {
+            struct stat st{};
+            bool file_exists = (stat("/data/local/tmp/.bobadlc_menu", &st) == 0);
+            if (file_exists) g_touch_menu_toggle.store(true);
+            sleep(1);
+        }
+        return;
+    }
 
     // берём первое найденное тач-устройство
     const std::string& dev = devices[0];
@@ -923,27 +949,24 @@ static fn_pm_void g_orig_on_enable = nullptr;
 static fn_pm_void g_orig_on_disable = nullptr;
 
 static void hooked_Awake(void* __this, void* method) {
-    // Call original first — lets Unity initialize the component
-    // orig может быть nullptr если ADRP-relocation не удалась — в этом случае
-    // компонент инициализируется самой Unity после возврата из хука (хук заменяет функцию)
-    // но для Awake это критично — пробуем вызвать оригинал только если он есть
+    // Вызываем оригинал ПЕРВЫМ — Unity должна инициализировать компонент
     if (g_orig_awake) g_orig_awake(__this, method);
 
     LOGI("Awake HIT! this=%p", __this);
 
-    // Mark first-ever awake as local player (heuristic: the one that calls Awake on game start)
-    // OnStartLocalPlayer (RVA 0x6673f78) is the definitive signal but Awake fires earlier.
-    // We'll refine local vs remote in OnEnable.
+    // Только сохраняем указатель — никаких чтений полей здесь
+    // Поля читаем позже в render thread когда всё инициализировано
     static bool first = true;
     if (first) {
         g_local_pm = __this;
         first = false;
         g_injected.store(true);
         init_camera_fns();
-        LOGI("local player set to %p", __this);
+        LOGI("local player set to %p, camera fns init done", __this);
     }
     add_player(__this);
 }
+
 
 static void hooked_OnEnable(void* __this, void* method) {
     if (g_orig_on_enable) g_orig_on_enable(__this, method);
