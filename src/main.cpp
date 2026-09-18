@@ -57,42 +57,53 @@ static void* read_root_domain_var(void* h) {
     memcpy(insns, fn_ptr, 8);
     LOGI("insn0=0x%08x insn1=0x%08x", insns[0], insns[1]);
     
-    // ARM64 ADRP: bits[31:29]=100, bits[28:24]=10000
-    // insns[0] should be ADRP Xn, <page_offset>
-    // insns[1] should be LDR Xn, [Xn, #imm] or RET
-    
-    // If insns[0] is just LDR (literal): bits[31:30]=01, bits[29:27]=011, bit[26]=0
-    // pattern: 0x58xxxxxx
-    if ((insns[0] & 0xFF000000) == 0x58000000) {
-        // LDR Xn, label — PC-relative load
-        int64_t imm = ((int32_t)(insns[0] & 0x00FFFFE0) >> 3);
-        uintptr_t var_addr = (uintptr_t)fn_ptr + imm;
-        LOGI("LDR literal: var_addr=0x%lx", var_addr);
-        void* domain = nullptr;
-        memcpy(&domain, (void*)var_addr, 8);
-        return domain;
+    // Follow B (branch) instruction if present
+    uintptr_t cur = (uintptr_t)fn_ptr;
+    for (int depth = 0; depth < 4; depth++) {
+        uint32_t in0 = 0, in1 = 0;
+        memcpy(&in0, (void*)cur, 4);
+        memcpy(&in1, (void*)(cur+4), 4);
+        LOGI("depth=%d @ 0x%lx insn0=0x%08x insn1=0x%08x", depth, cur, in0, in1);
+
+        // B unconditional: 0x14000000 mask
+        if ((in0 & 0xFC000000) == 0x14000000) {
+            int32_t imm26 = (int32_t)(in0 << 6) >> 6;
+            cur = cur + (int64_t)imm26 * 4;
+            LOGI("B -> 0x%lx", cur);
+            continue;
+        }
+        // BL: 0x94000000 — skip
+        if ((in0 & 0xFC000000) == 0x94000000) {
+            cur += 4; continue;
+        }
+        // LDR Xn, label (0x58000000)
+        if ((in0 & 0xFF000000) == 0x58000000) {
+            int32_t imm19 = (int32_t)(in0 << 8) >> 13;  // bits[23:5], *4
+            uintptr_t var_addr = cur + (int64_t)imm19 * 4;
+            LOGI("LDR literal: var=0x%lx", var_addr);
+            void* domain = nullptr;
+            memcpy(&domain, (void*)var_addr, 8);
+            return domain;
+        }
+        // ADRP (0x90000000)
+        if ((in0 & 0x9F000000) == 0x90000000) {
+            int64_t immhi = (int32_t)(in0 & 0x00FFFFE0) >> 3;
+            int64_t immlo = (in0 >> 29) & 3;
+            uintptr_t page = (cur & ~0xFFFULL) + ((immhi | immlo) << 12);
+            // next: LDR Xm, [Xn, #imm12*8]
+            uint32_t imm12 = (in1 >> 10) & 0xFFF;
+            uintptr_t var_addr = page + (uintptr_t)imm12 * 8;
+            LOGI("ADRP+LDR: page=0x%lx imm12=%d var=0x%lx", page, imm12, var_addr);
+            void* domain = nullptr;
+            memcpy(&domain, (void*)var_addr, 8);
+            return domain;
+        }
+        // RET
+        if (in0 == 0xD65F03C0) { LOGE("RET without finding var"); return nullptr; }
+        LOGE("unhandled insn 0x%08x at 0x%lx", in0, cur);
+        return nullptr;
     }
-    
-    // ADRP + LDR pattern
-    if ((insns[0] & 0x9F000000) == 0x90000000) {
-        // ADRP Xn, imm
-        uint32_t adrp = insns[0];
-        int64_t immhi = (int32_t)(adrp & 0x00FFFFE0) >> 3;
-        int64_t immlo = (adrp >> 29) & 3;
-        int64_t page_off = (immhi | immlo) << 12;
-        uintptr_t page = ((uintptr_t)fn_ptr & ~0xFFFULL) + page_off;
-        
-        // LDR Xm, [Xn, #imm12]
-        uint32_t ldr = insns[1];
-        uint32_t imm12 = (ldr >> 10) & 0xFFF;
-        uintptr_t var_addr = page + imm12 * 8;  // size=8 for 64-bit
-        LOGI("ADRP+LDR: page=0x%lx imm12=0x%x var=0x%lx", page, imm12, var_addr);
-        void* domain = nullptr;
-        memcpy(&domain, (void*)var_addr, 8);
-        return domain;
-    }
-    
-    LOGE("unknown insn pattern: 0x%08x", insns[0]);
+    LOGE("too many branches");
     return nullptr;
 }
 
