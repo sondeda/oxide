@@ -130,33 +130,6 @@ static inline void* rva(uintptr_t offset) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Hook loader — And64InlineHook (embedded, no external deps)
 // ─────────────────────────────────────────────────────────────────────────────
-// And64InlineHook used instead of shadowhook
-
-static bool load_shadowhook() {
-    // Not used — And64InlineHook is embedded directly
-    return true;
-}
-
-
-static bool do_hook(uintptr_t rva_offset, void* hook_fn, void** orig) {
-    void* target = rva(rva_offset);
-    bool ok = A64HookFunction(target, hook_fn, orig);
-    if (!ok) { LOGE("A64Hook failed at RVA 0x%lx", rva_offset); return false; }
-    LOGI("A64Hook OK at RVA 0x%lx  orig=%p", rva_offset, orig ? *orig : nullptr);
-    return true;
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Hook loader — And64InlineHook (embedded, no external deps)
-// ─────────────────────────────────────────────────────────────────────────────
-// And64InlineHook used instead of shadowhook
-
-static bool load_shadowhook() {
-    // Not used — And64InlineHook is embedded directly
-    return true;
-}
-
 
 static bool do_hook(uintptr_t rva_offset, void* hook_fn, void** orig) {
     void* target = rva(rva_offset);
@@ -983,8 +956,6 @@ static void hooked_OnDisable(void* __this, void* method) {
 // Hook installation
 // ─────────────────────────────────────────────────────────────────────────────
 static void install_hooks() {
-    if (!load_shadowhook()) { LOGE("shadowhook load failed"); return; }
-
     // PlayerManager hooks
     do_hook(RVA_PM_Awake,     (void*)hooked_Awake,      (void**)&g_orig_awake);
     do_hook(RVA_PM_OnEnable,  (void*)hooked_OnEnable,   (void**)&g_orig_on_enable);

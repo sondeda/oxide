@@ -84,14 +84,14 @@ static bool A64HookFunction(void* target, void* hook, void** orig) {
     // Write: copied instructions + jump back to target+16
     memcpy(tramp, to_copy, 16);
     _a64_write_jump(tramp + 16, tgt + 16);
-    __builtin___clear_cache(tramp, tramp + 32);
+    __builtin___clear_cache((char*)tramp, (char*)tramp + 32);
 
     if (orig) *orig = tramp;
 
     // Patch target: write jump to hook
     _a64_mprotect_rwx((void*)tgt, 32);
     _a64_write_jump((void*)tgt, (uintptr_t)hook);
-    __builtin___clear_cache((void*)tgt, (void*)(tgt + 16));
+    __builtin___clear_cache((char*)tgt, (char*)(tgt + 16));
 
     return true;
 }
