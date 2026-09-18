@@ -1,33 +1,14 @@
-// And64InlineHook v2 — ARM64 inline hook, header-only
-// Стратегия: вместо копирования инструкций используем 2-instruction stub в самой функции.
-// Это работает даже если первая инструкция — ADRP.
-//
-// Патч в target: 16 байт
-//   LDR X17, #8     ; загрузить адрес хука из следующих 8 байт
-//   BR  X17         ; прыжок
-//   .quad hook_addr ; адрес нашего хука
-//
-// Трамплин для orig (чтобы вызвать оригинал):
-//   Мы сохраняем ПЕРВЫЕ 4 оригинальные инструкции ПЕРЕД патчем.
-//   Затем прыгаем на target+16 (пропуская патч).
-//   НО если там ADRP — она не будет работать из трамплина.
-//
-// Правильное решение для ADRP: используем hook без orig-трамплина.
-// Для Awake/OnEnable/OnDisable нам orig нужен — вызываем через backup.
-//
-// ФИНАЛЬНАЯ стратегия:
-// 1. Читаем первые 4 инструкции
-// 2. Если все позиционно-независимые — копируем в трамплин + прыжок назад
-// 3. Если есть ADRP — используем "detour без orig": просто патчим прыжок,
-//    orig = nullptr (хук сам решает когда вызывать оригинал по сохранённому адресу)
-// 4. Для нашего случая: orig указатель заполняем адресом target+16 минуя патч
-//    (это работает только если ADRP не в первых 4 инструкциях которые мы перезаписываем)
-//
-// САМЫЙ НАДЁЖНЫЙ подход для Unity IL2CPP:
-// Патчим только ПЕРВЫЕ 4 байта (1 инструкцию) через BL-трамплин в свободную память,
-// а трамплин уже делает полный прыжок. Но это сложно.
-//
-// ИТОГ: используем 16-байтный патч + трамплин с full relocation через эмуляцию ADRP.
+// And64InlineHook v3 — ARM64, header-only
+// Стратегия "restore-call-repatch":
+// 1. Сохраняем оригинальные 16 байт функции
+// 2. Пишем наш jump патч
+// 3. orig = специальный трамплин который:
+//    a) убирает патч (восстанавливает оригинальные байты)
+//    b) вызывает оригинальную функцию
+//    c) ставит патч обратно
+// Это работает с ЛЮБЫМИ инструкциями включая ADRP.
+// Недостаток: не thread-safe при одновременных вызовах.
+// Для Unity single-thread lifecycle методов (Awake/OnEnable/OnDisable) — ОК.
 
 #pragma once
 #include <cstdint>
@@ -35,136 +16,133 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-// Пул для трамплинов — 8KB
-static uint8_t  _a64_pool[8192] __attribute__((aligned(4096)));
+struct A64HookEntry {
+    void*   target;
+    uint8_t orig_bytes[16];   // оригинальные инструкции
+    uint8_t patch_bytes[16];  // наш jump патч
+    bool    patched;
+};
+
+static A64HookEntry _a64_entries[16];
+static int          _a64_entry_count = 0;
+
+// Трамплин-функции (по одной на каждый хук, до 8 штук)
+// Каждый трамплин: снимает патч → вызывает orig → ставит патч обратно
+// Генерируем их динамически в пуле
+
+static uint8_t  _a64_pool[4096] __attribute__((aligned(4096)));
 static uint32_t _a64_pool_off = 0;
 static bool     _a64_pool_ready = false;
 
 static inline void _a64_mprotect(void* addr, size_t len, int prot) {
     long pgsz = getpagesize();
     uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(pgsz - 1);
-    mprotect((void*)start, (size_t)((uintptr_t)addr - start) + len + pgsz, prot);
+    mprotect((void*)start, (size_t)((uintptr_t)addr - start) + len + (size_t)pgsz, prot);
 }
 
-// Записать 16-байтный абсолютный прыжок: LDR X17,#8; BR X17; .quad target
-static inline void _a64_write_abs_jump(void* where, uintptr_t target) {
+static inline void _a64_write_abs_jump(void* where, uintptr_t target_addr) {
     uint32_t* p = (uint32_t*)where;
     p[0] = 0x58000051u; // LDR X17, #8
     p[1] = 0xD61F0220u; // BR X17
-    *(uintptr_t*)(p + 2) = target;
+    *(uintptr_t*)(p + 2) = target_addr;
 }
 
-// Проверить позиционную независимость инструкции
-static inline bool _a64_insn_relocatable(uint32_t insn) {
-    if ((insn & 0x9F000000u) == 0x90000000u) return false; // ADRP
-    if ((insn & 0xFC000000u) == 0x14000000u) return false; // B
-    if ((insn & 0xFC000000u) == 0x94000000u) return false; // BL
-    if ((insn & 0xFF000010u) == 0x54000000u) return false; // B.cond
-    if ((insn & 0x7E000000u) == 0x34000000u) return false; // CBZ/CBNZ
-    if ((insn & 0x7E000000u) == 0x36000000u) return false; // TBZ/TBNZ
-    if ((insn & 0x3B000000u) == 0x18000000u) return false; // LDR literal
-    return true;
+// C-функция которую вызывает каждый трамплин
+// Снимает патч, вызывает оригинал, ставит патч обратно
+// entry_idx — индекс в _a64_entries
+extern "C" void _a64_restore_call(int entry_idx, void* __this, void* method) {
+    A64HookEntry& e = _a64_entries[entry_idx];
+    // снять патч
+    _a64_mprotect(e.target, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy(e.target, e.orig_bytes, 16);
+    __builtin___clear_cache((char*)e.target, (char*)e.target + 16);
+    // вызвать оригинал
+    using fn_t = void(*)(void*, void*);
+    ((fn_t)e.target)(__this, method);
+    // поставить патч обратно
+    memcpy(e.target, e.patch_bytes, 16);
+    __builtin___clear_cache((char*)e.target, (char*)e.target + 16);
+    _a64_mprotect(e.target, 16, PROT_READ | PROT_EXEC);
 }
 
-// Relocate ADRP + следующая инструкция (ADD/LDR) в трамплин
-// Возвращает сколько инструкций обработано (2) или 0 если не смогли
-static int _a64_relocate_adrp(uint32_t* src_insns, uintptr_t src_pc,
-                                uint32_t* dst, uintptr_t dst_pc) {
-    uint32_t adrp = src_insns[0];
-    uint32_t next = src_insns[1];
-
-    // Декодируем ADRP
-    int rd = (int)(adrp & 0x1F);
-    int64_t imm = (int64_t)(((adrp >> 5) & 0x7FFFF) | (((adrp >> 29) & 0x3) << 19));
-    imm = (imm << 12) >> 12; // sign-extend 21 bits shifted by 12
-    imm <<= 12;
-    uintptr_t page_addr = (src_pc & ~(uintptr_t)0xFFF) + (uintptr_t)imm;
-
-    // Генерируем: MOVZ Xrd, #lo16; MOVK Xrd, #hi16, LSL#16; MOVK Xrd, #hi32, LSL#32
-    uint64_t val = (uint64_t)page_addr;
-    // MOVZ Xrd, val[15:0]
-    dst[0] = 0xD2800000u | (uint32_t)rd | (((val >>  0) & 0xFFFF) << 5);
-    // MOVK Xrd, val[31:16], LSL#16
-    dst[1] = 0xF2A00000u | (uint32_t)rd | (((val >> 16) & 0xFFFF) << 5);
-    // MOVK Xrd, val[47:32], LSL#32
-    dst[2] = 0xF2C00000u | (uint32_t)rd | (((val >> 32) & 0xFFFF) << 5);
-    // MOVK Xrd, val[63:48], LSL#48
-    dst[3] = 0xF2E00000u | (uint32_t)rd | (((val >> 48) & 0xFFFF) << 5);
-    // Копируем следующую инструкцию (ADD/LDR/STR которая использует Xrd+offset)
-    dst[4] = next;
-    return 2; // обработали 2 инструкции, записали 5
-}
-
-// Главная функция хука
-// Возвращает true если хук установлен
-// *orig будет указывать на трамплин для вызова оригинала (может быть nullptr если не удалось)
-static bool A64HookFunction(void* target, void* hook, void** orig) {
-    if (!target || !hook) return false;
-
-    uintptr_t tgt = (uintptr_t)target;
-    uint32_t* insns = (uint32_t*)tgt;
-
-    // Инициализируем пул один раз
+// Трамплин-stub для каждого хука (ARM64 asm)
+// Вызывает _a64_restore_call(idx, x0, x1)
+// x0 и x1 уже содержат __this и method (первые два аргумента функции)
+static void* _a64_make_trampoline(int idx) {
     if (!_a64_pool_ready) {
         _a64_mprotect(_a64_pool, sizeof(_a64_pool), PROT_READ | PROT_WRITE | PROT_EXEC);
         _a64_pool_ready = true;
     }
+    if (_a64_pool_off + 64 > sizeof(_a64_pool)) return nullptr;
+    uint32_t* t = (uint32_t*)(_a64_pool + _a64_pool_off);
+    _a64_pool_off += 64;
 
-    // Выделяем трамплин
-    if (_a64_pool_off + 128 > sizeof(_a64_pool)) return false;
-    uint8_t*  tramp     = _a64_pool + _a64_pool_off;
-    uint32_t* tramp32   = (uint32_t*)tramp;
-    _a64_pool_off += 128;
+    // ARM64:
+    // STP X0, X1, [SP, #-32]!   ; сохраняем x0 (this) и x1 (method)
+    // STP X29, X30, [SP, #16]   ; сохраняем fp и lr
+    // MOV W0, #idx              ; первый аргумент = idx
+    // LDP X1, X2, [SP]          ; восстанавливаем __this в x1, method в x2
+    //   (но _a64_restore_call принимает int, void*, void*)
+    // нет, проще:
+    // сохраняем x0,x1,x29,x30
+    // x2 = x1 (method), x1 = x0 (__this), x0 = idx
+    // вызываем _a64_restore_call
+    // восстанавливаем x29,x30
+    // RET
 
-    // Пытаемся скопировать/relocate ровно 4 инструкции (16 байт которые мы затрём)
-    int src_idx  = 0; // сколько оригинальных инструкций обработано
-    int dst_idx  = 0; // сколько инструкций записано в трамплин
+    // STP X29, X30, [SP, #-32]!
+    t[0]  = 0xA9BE7BFDU;
+    // STP X0, X1, [SP, #16]
+    t[1]  = 0xA9010FE0U;
+    // MOV X2, X1  (method → x2)
+    t[2]  = 0xAA0103E2U;
+    // MOV X1, X0  (__this → x1)
+    t[3]  = 0xAA0003E1U;
+    // MOV W0, #idx
+    t[4]  = 0x52800000U | ((uint32_t)(idx & 0xFFFF) << 5);
+    // LDR X16, #24  (загружаем адрес _a64_restore_call из literal pool)
+    t[5]  = 0x58000190U;
+    // BLR X16
+    t[6]  = 0xD63F0200U;
+    // LDP X0, X1, [SP, #16]  (не нужно восстанавливать x0/x1 — void return)
+    // LDP X29, X30, [SP], #32
+    t[7]  = 0xA8C27BFDU;
+    // RET
+    t[8]  = 0xD65F03C0U;
+    // literal: адрес _a64_restore_call (8 байт)
+    *(uintptr_t*)(t + 9) = (uintptr_t)_a64_restore_call;
 
-    while (src_idx < 4) {
-        uint32_t insn = insns[src_idx];
-        uintptr_t cur_pc = tgt + (uintptr_t)src_idx * 4;
-        uintptr_t dst_pc = (uintptr_t)tramp + (uintptr_t)dst_idx * 4;
+    __builtin___clear_cache((char*)t, (char*)t + 64);
+    return (void*)t;
+}
 
-        if ((insn & 0x9F000000u) == 0x90000000u) {
-            // ADRP — relocate
-            if (src_idx + 1 >= 8) { goto fallback; } // нет следующей инструкции
-            int consumed = _a64_relocate_adrp(insns + src_idx, cur_pc,
-                                               tramp32 + dst_idx, dst_pc);
-            if (consumed == 0) goto fallback;
-            src_idx += consumed;
-            dst_idx += 5; // 4 MOV + 1 следующая
-        } else if (_a64_insn_relocatable(insn)) {
-            tramp32[dst_idx++] = insn;
-            src_idx++;
-        } else {
-            goto fallback;
-        }
+static bool A64HookFunction(void* target, void* hook, void** orig) {
+    if (!target || !hook) return false;
+    if (_a64_entry_count >= 16) return false;
+
+    int idx = _a64_entry_count++;
+    A64HookEntry& e = _a64_entries[idx];
+    e.target  = target;
+    e.patched = false;
+
+    // сохраняем оригинальные 16 байт
+    memcpy(e.orig_bytes, target, 16);
+
+    // строим патч (jump к hook)
+    _a64_write_abs_jump(e.patch_bytes, (uintptr_t)hook);
+
+    // ставим патч
+    _a64_mprotect(target, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy(target, e.patch_bytes, 16);
+    __builtin___clear_cache((char*)target, (char*)target + 16);
+    _a64_mprotect(target, 16, PROT_READ | PROT_EXEC);
+    e.patched = true;
+
+    // создаём трамплин для вызова оригинала
+    if (orig) {
+        void* tramp = _a64_make_trampoline(idx);
+        *orig = tramp;
     }
 
-    // Дописываем прыжок в трамплине: прыгаем на target + 16 (после патча)
-    _a64_write_abs_jump(tramp + dst_idx * 4, tgt + 16);
-    __builtin___clear_cache((char*)tramp, (char*)tramp + 128);
-    if (orig) *orig = tramp;
-
-    // Патчим target
-    _a64_mprotect((void*)tgt, 32, PROT_READ | PROT_WRITE | PROT_EXEC);
-    _a64_write_abs_jump((void*)tgt, (uintptr_t)hook);
-    __builtin___clear_cache((char*)tgt, (char*)tgt + 16);
-    _a64_mprotect((void*)tgt, 32, PROT_READ | PROT_EXEC);
     return true;
-
-fallback:
-    // Не смогли сделать трамплин — ставим хук без orig (orig = nullptr)
-    // Это значит хук-функция не должна вызывать оригинал через указатель.
-    // Для Awake/OnEnable/OnDisable: просто не вызываем orig — игра не крашнет
-    // потому что Unity сама дойдёт до тела функции после нашего хука... нет,
-    // без orig мы заменяем функцию полностью. Поэтому возвращаем false.
-    if (orig) *orig = nullptr;
-    // Последний шанс: patching без трамплина — orig будет nullptr,
-    // хук-функция обязана НЕ вызывать orig.
-    _a64_mprotect((void*)tgt, 32, PROT_READ | PROT_WRITE | PROT_EXEC);
-    _a64_write_abs_jump((void*)tgt, (uintptr_t)hook);
-    __builtin___clear_cache((char*)tgt, (char*)tgt + 16);
-    _a64_mprotect((void*)tgt, 32, PROT_READ | PROT_EXEC);
-    return true; // хук поставлен, но orig = nullptr
 }
