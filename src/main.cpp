@@ -95,8 +95,7 @@ static void* find_csharp_image(void* domain) {
     auto name_fn = FN(fn_name, RVA_image_name);
 
     // Try corlib to confirm domain works
-    auto corlib_fn = FN(fn_vv, RVA_corlib);
-    void* corlib = corlib_fn();
+    void* corlib = FN(fn_vp, RVA_corlib)(domain);
     LOGI("corlib: %p", corlib);
 
     // Scan domain offsets 0x40..0xC0 for GSList of assemblies
