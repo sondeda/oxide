@@ -30,6 +30,7 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include "zygisk.hpp"
+#include "And64InlineHook.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Logging
@@ -127,50 +128,41 @@ static inline void* rva(uintptr_t offset) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// shadowhook (already loaded by game — we just dlopen with RTLD_NOLOAD)
+// Hook loader — And64InlineHook (embedded, no external deps)
 // ─────────────────────────────────────────────────────────────────────────────
-using fn_sh_init = int(*)(int mode, void* option);
-using fn_sh_hook = void*(*)(void* func, void* new_func, void** orig);
-
-static fn_sh_init  sh_init  = nullptr;
-static fn_sh_hook  sh_hook  = nullptr;
+// And64InlineHook used instead of shadowhook
 
 static bool load_shadowhook() {
-    // game already loaded it; RTLD_NOLOAD returns handle without re-loading
-    void* h = dlopen("libshadowhook.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!h) {
-        // fallback: try full path via /proc/self/maps
-        std::ifstream maps("/proc/self/maps");
-        std::string line;
-        while (std::getline(maps, line)) {
-            if (line.find("libshadowhook.so") == std::string::npos) continue;
-            size_t slash = line.rfind('/');
-            if (slash == std::string::npos) continue;
-            std::string path = line.substr(slash);
-            // trim newline/space
-            while (!path.empty() && (path.back() == '\n' || path.back() == ' '))
-                path.pop_back();
-            h = dlopen(path.c_str(), RTLD_LAZY | RTLD_GLOBAL);
-            if (h) break;
-        }
-    }
-    if (!h) { LOGE("shadowhook: dlopen failed: %s", dlerror()); return false; }
-
-    sh_init = (fn_sh_init)dlsym(h, "shadowhook_init");
-    sh_hook = (fn_sh_hook)dlsym(h, "shadowhook_hook_func_addr");
-
-    if (!sh_init || !sh_hook) { LOGE("shadowhook: symbols not found"); return false; }
-    // SHADOWHOOK_MODE_UNIQUE = 1
-    int r = sh_init(1, nullptr);
-    LOGI("shadowhook_init returned %d", r);
+    // Not used — And64InlineHook is embedded directly
     return true;
 }
 
+
 static bool do_hook(uintptr_t rva_offset, void* hook_fn, void** orig) {
     void* target = rva(rva_offset);
-    void* stub = sh_hook(target, hook_fn, orig);
-    if (!stub) { LOGE("hook failed at RVA 0x%lx", rva_offset); return false; }
-    LOGI("hooked RVA 0x%lx -> stub %p", rva_offset, stub);
+    bool ok = A64HookFunction(target, hook_fn, orig);
+    if (!ok) { LOGE("A64Hook failed at RVA 0x%lx", rva_offset); return false; }
+    LOGI("A64Hook OK at RVA 0x%lx  orig=%p", rva_offset, orig ? *orig : nullptr);
+    return true;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hook loader — And64InlineHook (embedded, no external deps)
+// ─────────────────────────────────────────────────────────────────────────────
+// And64InlineHook used instead of shadowhook
+
+static bool load_shadowhook() {
+    // Not used — And64InlineHook is embedded directly
+    return true;
+}
+
+
+static bool do_hook(uintptr_t rva_offset, void* hook_fn, void** orig) {
+    void* target = rva(rva_offset);
+    bool ok = A64HookFunction(target, hook_fn, orig);
+    if (!ok) { LOGE("A64Hook FAILED at RVA 0x%lx", rva_offset); return false; }
+    LOGI("A64Hook OK at RVA 0x%lx  orig=%p", rva_offset, orig ? *orig : nullptr);
     return true;
 }
 
@@ -1004,8 +996,8 @@ static void install_hooks() {
     if (egl_lib) {
         void* swap_fn = dlsym(egl_lib, "eglSwapBuffers");
         if (swap_fn) {
-            void* stub = sh_hook(swap_fn, (void*)hooked_eglSwapBuffers, (void**)&g_orig_swap);
-            LOGI("eglSwapBuffers hook: stub=%p", stub);
+            bool ok = A64HookFunction(swap_fn, (void*)hooked_eglSwapBuffers, (void**)&g_orig_swap);
+            LOGI("eglSwapBuffers hook: %s  orig=%p", ok ? "OK" : "FAIL", g_orig_swap);
         } else {
             LOGE("eglSwapBuffers not found in libEGL.so");
         }
