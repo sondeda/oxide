@@ -80,49 +80,44 @@ static T rd(uintptr_t addr) {
 // ── find Assembly-CSharp ──────────────────────────────────────────────────────
 static void* g_image = nullptr;
 
-// GSList node: data(0x0) next(0x8)
 struct GSList { void* data; GSList* next; };
 
-static bool is_valid_ptr(void* p) {
+static bool vptr(void* p) {
     uintptr_t v = (uintptr_t)p;
     return v > 0x10000 && v < 0x7fffffffffff;
 }
 
+static bool valid_str(const char* s) {
+    if (!vptr((void*)s)) return false;
+    for (int i = 0; i < 128; i++) {
+        if (s[i] == 0) return i > 0;
+        if ((unsigned char)s[i] > 127) return false;
+    }
+    return false;
+}
+
+// mono_domain_get_assemblies_iter(domain, include_unref) -> GSList*
+using fn_get_asms = GSList*(*)(void*, int);
+
 static void* find_csharp_image(void* domain) {
     auto img_fn  = FN(fn_v_p,  RVA_assembly_get_image);
     auto name_fn = FN(fn_name, RVA_image_get_name);
+    auto asms_fn = FN(fn_get_asms, RVA_assemblies_iter);
 
-    // MonoDomain has loaded_assemblies (GSList*) at offset ~0x38..0xB0
-    // Scan domain memory for GSList that leads to Assembly-CSharp
-    for (int off = 0x30; off <= 0x100; off += 8) {
-        void* candidate = *(void**)((uintptr_t)domain + off);
-        if (!is_valid_ptr(candidate)) continue;
+    // call with include_unref=1
+    GSList* list = asms_fn(domain, 1);
+    LOGI("assemblies list: %p", list);
 
-        // treat as GSList
-        auto* node = (GSList*)candidate;
-        int count = 0;
-        while (node && is_valid_ptr(node) && is_valid_ptr(node->data) && count < 256) {
-            void* img = img_fn(node->data);
-            if (img && is_valid_ptr(img)) {
-                const char* name = name_fn(img);
-                if (name && is_valid_ptr((void*)name)) {
-                    // valid string check
-                    bool ok = true;
-                    for (int c = 0; c < 64; c++) {
-                        if (name[c] == 0) break;
-                        if ((unsigned char)name[c] > 127) { ok = false; break; }
-                    }
-                    if (ok && strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass")) {
-                        LOGI("found Assembly-CSharp at domain+0x%x img=%p", off, img);
-                        return img;
-                    }
-                }
-            }
-            node = node->next;
-            count++;
-        }
+    for (auto* node = list; node && vptr(node) && vptr(node->data); node = node->next) {
+        void* img = img_fn(node->data);
+        if (!img || !vptr(img)) continue;
+        const char* name = name_fn(img);
+        if (!valid_str(name)) continue;
+        LOGI("asm: %s", name);
+        if (strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
+            return img;
     }
-    LOGE("Assembly-CSharp not found in domain scan");
+    LOGE("Assembly-CSharp not found");
     return nullptr;
 }
 
