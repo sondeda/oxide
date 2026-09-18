@@ -14,20 +14,16 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// Function types
 using fn_vv = void*(*)();
 using fn_vp = void*(*)(void*);
 using fn_nm = const char*(*)(void*);
 using fn_ta = void*(*)(void*);
 
-static fn_vv g_domain_get    = nullptr;
-static fn_vv g_root_domain   = nullptr;
 static fn_ta g_thread_attach = nullptr;
 static fn_vp g_corlib        = nullptr;
 static fn_vp g_asm_image     = nullptr;
 static fn_nm g_img_name      = nullptr;
 
-// Find full path to libil2cpp.so from /proc/self/maps
 static std::string find_il2cpp_path() {
     std::ifstream f("/proc/self/maps");
     std::string line;
@@ -37,7 +33,6 @@ static std::string find_il2cpp_path() {
         auto pos = line.rfind(' ');
         if (pos == std::string::npos) continue;
         std::string path = line.substr(pos + 1);
-        // trim newline
         while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
             path.pop_back();
         return path;
@@ -45,48 +40,72 @@ static std::string find_il2cpp_path() {
     return "";
 }
 
-static bool load_symbols() {
-    std::string path = find_il2cpp_path();
-    if (path.empty()) { LOGE("il2cpp path not found"); return false; }
-    LOGI("path: %s", path.c_str());
-
-    // Open with RTLD_NOLOAD first (already loaded), then with RTLD_NOW|RTLD_GLOBAL
-    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
-    if (!h) {
-        LOGE("dlopen failed: %s", dlerror());
-        return false;
+// Read domain pointer directly from mono_root_domain global var
+// mono_get_root_domain (RVA 0x574ae14, size 4) is:
+//   adrp x0, <page>
+//   ldr x0, [x0, #offset]  (or similar)
+//   ret
+// We disassemble it to find where the global var lives
+static void* read_root_domain_var(void* h) {
+    // Get address of mono_get_root_domain function
+    void* fn_ptr = dlsym(h, "mono_get_root_domain");
+    if (!fn_ptr) { LOGE("mono_get_root_domain not found"); return nullptr; }
+    LOGI("mono_get_root_domain @ %p", fn_ptr);
+    
+    // Read first 8 bytes (2 ARM64 instructions)
+    uint32_t insns[2] = {};
+    memcpy(insns, fn_ptr, 8);
+    LOGI("insn0=0x%08x insn1=0x%08x", insns[0], insns[1]);
+    
+    // ARM64 ADRP: bits[31:29]=100, bits[28:24]=10000
+    // insns[0] should be ADRP Xn, <page_offset>
+    // insns[1] should be LDR Xn, [Xn, #imm] or RET
+    
+    // If insns[0] is just LDR (literal): bits[31:30]=01, bits[29:27]=011, bit[26]=0
+    // pattern: 0x58xxxxxx
+    if ((insns[0] & 0xFF000000) == 0x58000000) {
+        // LDR Xn, label — PC-relative load
+        int64_t imm = ((int32_t)(insns[0] & 0x00FFFFE0) >> 3);
+        uintptr_t var_addr = (uintptr_t)fn_ptr + imm;
+        LOGI("LDR literal: var_addr=0x%lx", var_addr);
+        void* domain = nullptr;
+        memcpy(&domain, (void*)var_addr, 8);
+        return domain;
     }
-    LOGI("handle: %p", h);
-
-    g_domain_get    = (fn_vv)dlsym(h, "mono_domain_get");
-    g_root_domain   = (fn_vv)dlsym(h, "mono_get_root_domain");
-    g_thread_attach = (fn_ta)dlsym(h, "mono_thread_attach");
-    g_corlib        = (fn_vp)dlsym(h, "mono_domain_get_corlib");
-    g_asm_image     = (fn_vp)dlsym(h, "mono_image_get_assembly");
-    g_img_name      = (fn_nm)dlsym(h, "mono_image_get_name");
-
-    LOGI("domain_get=%p root=%p attach=%p corlib=%p",
-         (void*)g_domain_get, (void*)g_root_domain,
-         (void*)g_thread_attach, (void*)g_corlib);
-
-    if (!g_domain_get && !g_root_domain) {
-        LOGE("critical symbols missing");
-        return false;
+    
+    // ADRP + LDR pattern
+    if ((insns[0] & 0x9F000000) == 0x90000000) {
+        // ADRP Xn, imm
+        uint32_t adrp = insns[0];
+        int64_t immhi = (int32_t)(adrp & 0x00FFFFE0) >> 3;
+        int64_t immlo = (adrp >> 29) & 3;
+        int64_t page_off = (immhi | immlo) << 12;
+        uintptr_t page = ((uintptr_t)fn_ptr & ~0xFFFULL) + page_off;
+        
+        // LDR Xm, [Xn, #imm12]
+        uint32_t ldr = insns[1];
+        uint32_t imm12 = (ldr >> 10) & 0xFFF;
+        uintptr_t var_addr = page + imm12 * 8;  // size=8 for 64-bit
+        LOGI("ADRP+LDR: page=0x%lx imm12=0x%x var=0x%lx", page, imm12, var_addr);
+        void* domain = nullptr;
+        memcpy(&domain, (void*)var_addr, 8);
+        return domain;
     }
-    return true;
+    
+    LOGE("unknown insn pattern: 0x%08x", insns[0]);
+    return nullptr;
 }
-
-struct GSList { void* data; void* next; };
 
 static void* find_csharp(void* domain) {
     if (!g_corlib || !g_asm_image || !g_img_name) return nullptr;
 
     void* corlib = g_corlib(domain);
     LOGI("corlib=%p", corlib);
+    if (!corlib || (uintptr_t)corlib < 0x10000) return nullptr;
 
-    // Scan domain for assembly list
     for (int off = 0x40; off <= 0xC0; off += 8) {
         uintptr_t list = 0;
+        if ((uintptr_t)domain + off < 0x10000) continue;
         memcpy(&list, (char*)domain + off, sizeof(list));
         if (list < 0x10000 || list > 0x7fffffffffff) continue;
 
@@ -97,13 +116,11 @@ static void* find_csharp(void* domain) {
         void* img0 = g_asm_image((void*)data0);
         if (!img0 || (uintptr_t)img0 < 0x10000) continue;
 
-        // Walk list
         uintptr_t node = list;
         for (int i = 0; i < 256 && node > 0x10000; i++) {
             uintptr_t data = 0, next = 0;
-            memcpy(&data, (void*)node,     sizeof(data));
-            memcpy(&next, (char*)node + 8, sizeof(next));
-
+            memcpy(&data, (void*)node,     8);
+            memcpy(&next, (char*)node + 8, 8);
             if (data > 0x10000) {
                 void* img = g_asm_image((void*)data);
                 if (img && (uintptr_t)img > 0x10000) {
@@ -126,24 +143,33 @@ static void cheat_main() {
     sleep(25);
     LOGI("Starting");
 
-    if (!load_symbols()) return;
+    std::string path = find_il2cpp_path();
+    if (path.empty()) { LOGE("path not found"); return; }
+    LOGI("path: %s", path.c_str());
 
-    // Try root_domain first - safer than domain_get
-    void* domain = nullptr;
-    if (g_root_domain) {
-        domain = g_root_domain();
-        LOGI("root_domain=%p", domain);
-    }
-    if (!domain && g_domain_get) {
-        domain = g_domain_get();
-        LOGI("domain_get=%p", domain);
-    }
-    if (!domain || (uintptr_t)domain < 0x10000) { LOGE("no domain"); return; }
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
+    if (!h) { LOGE("dlopen: %s", dlerror()); return; }
 
-    if (g_thread_attach) {
-        void* thr = g_thread_attach(domain);
-        LOGI("attached thr=%p", thr);
+    g_thread_attach = (fn_ta)dlsym(h, "mono_thread_attach");
+    g_corlib        = (fn_vp)dlsym(h, "mono_domain_get_corlib");
+    g_asm_image     = (fn_vp)dlsym(h, "mono_image_get_assembly");
+    g_img_name      = (fn_nm)dlsym(h, "mono_image_get_name");
+
+    LOGI("attach=%p corlib=%p asm=%p name=%p",
+         (void*)g_thread_attach, (void*)g_corlib,
+         (void*)g_asm_image, (void*)g_img_name);
+
+    // Read domain directly from global var — no function call
+    void* domain = read_root_domain_var(h);
+    LOGI("domain from var: %p", domain);
+    
+    if (!domain || (uintptr_t)domain < 0x10000) {
+        LOGE("domain null — Mono not initialized yet?");
+        return;
     }
+
+    if (g_thread_attach) g_thread_attach(domain);
+    LOGI("attached");
 
     void* img = find_csharp(domain);
     if (!img) { LOGE("Assembly-CSharp not found"); return; }
