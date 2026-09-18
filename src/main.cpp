@@ -51,9 +51,13 @@ static uintptr_t find_bias(const char* lib) {
         if (line.find(lib) == std::string::npos) continue;
         if (line.find("r-xp") == std::string::npos) continue;
         uintptr_t start  = strtoull(line.c_str(), nullptr, 16);
-        // offset field is 4th space-separated token
+        // offset is 3rd token: skip past "start-end perms " then read offset
+        // format: "addr-addr perms offset dev inode path"
         const char* p = line.c_str();
-        for (int i = 0; i < 3; i++) { while (*p && *p != ' ') p++; while (*p == ' ') p++; }
+        while (*p && *p != ' ') p++;  // skip addr range
+        while (*p == ' ') p++;         // skip spaces
+        while (*p && *p != ' ') p++;  // skip perms
+        while (*p == ' ') p++;         // skip spaces
         uintptr_t offset = strtoull(p, nullptr, 16);
         uintptr_t bias   = start - offset;
         LOGI("bias=0x%lx start=0x%lx off=0x%lx", bias, start, offset);
