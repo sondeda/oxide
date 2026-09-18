@@ -476,20 +476,9 @@ static float text_width(const char* text, float scale) {
 static void render_esp() {
     if (!g_menu.esp_enabled) return;
 
-    // Ждём 120 фреймов после инжекта перед рендером ESP
-    // чтобы игра полностью инициализировалась
+    // Ждём 180 фреймов после инжекта
     static int frame_delay = 0;
-    if (frame_delay < 120) { frame_delay++; return; }
-
-    // Проверяем что функции камеры инициализированы
-    if (!g_cam_getmain || !g_cam_w2s) return;
-
-    void* cam = g_cam_getmain(nullptr);
-    if (!cam) return;
-
-    // Дополнительная проверка валидности объекта камеры
-    void* cam_klass = *(void**)cam;
-    if (!safe_ptr(cam_klass)) return;
+    if (frame_delay < 180) { frame_delay++; return; }
 
     std::vector<void*> players_copy;
     void* local_copy;
@@ -498,105 +487,66 @@ static void render_esp() {
         players_copy = g_players;
         local_copy   = g_local_pm;
     }
-
-    Vec3 local_pos{};
-    if (local_copy && safe_ptr(local_copy))
-        local_pos = read_field<Vec3>(local_copy, OFF_PM_lastTickPosition);
+    if (players_copy.empty()) return;
 
     float W = (float)g_scr_w;
     float H = (float)g_scr_h;
 
+    // Рисуем 2D список игроков в правом верхнем углу (без world-to-screen)
+    float list_x = W - 200.f;
+    float list_y = 40.f;
+
+    draw_rect_filled(list_x - 4.f, list_y - 4.f, 196.f, 14.f + players_copy.size() * 20.f,
+                     0.f, 0.f, 0.f, 0.5f);
+    draw_text("PLAYERS", list_x, list_y, 1.5f, 0.9f, 0.08f, 0.08f, 1.f);
+    list_y += 14.f;
+
+    int drawn = 0;
     for (void* pm : players_copy) {
-        if (!pm || !safe_ptr(pm)) continue;
-        if (pm == local_copy) continue;
+        if (!pm) continue;
+        if (drawn >= 10) break; // максимум 10 в списке
 
-        // Проверяем что объект ещё жив — klass pointer должен быть валидным
+        // Проверяем валидность объекта
         void* klass_ptr = *(void**)pm;
-        if (!safe_ptr(klass_ptr)) continue;
+        if ((uintptr_t)klass_ptr < 0x1000) continue;
 
-        PlayerInfo pi = snapshot_player(pm);
+        // Читаем имя
+        std::string name = "Player";
+        float hp = 0.f;
 
-        // distance filter
-        float dx = pi.pos.x - local_pos.x;
-        float dy = pi.pos.y - local_pos.y;
-        float dz = pi.pos.z - local_pos.z;
-        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-        if (dist > g_menu.esp_max_dist) continue;
+        void* peh = *(void**)((uintptr_t)pm + OFF_PM_playerEventHandler);
+        if ((uintptr_t)peh > 0x1000) {
+            void* name_str = *(void**)((uintptr_t)peh + OFF_GuB_DisplayName);
+            if ((uintptr_t)name_str > 0x1000)
+                name = read_il2cpp_string(name_str);
 
-        // project head + feet
-        Vec3 feet_w = pi.pos;
-        Vec3 head_w = { pi.pos.x, pi.pos.y + 1.8f, pi.pos.z };
-
-        Vec2 feet_s, head_s;
-        if (!world_to_screen(cam, feet_w, feet_s)) continue;
-        if (!world_to_screen(cam, head_w, head_s)) continue;
-
-        // flip Y (screen Y is inverted vs world)
-        feet_s.y = H - feet_s.y;
-        head_s.y = H - head_s.y;
-
-        float box_h = feet_s.y - head_s.y;
-        if (box_h < 4.f) continue;
-        float box_w = box_h * 0.4f;
-        float bx = head_s.x - box_w * 0.5f;
-        float by = head_s.y;
-
-        // ESP box (red outline + dark fill)
-        if (g_menu.esp_box) {
-            draw_rect_filled(bx, by, box_w, box_h, 0.f, 0.f, 0.f, 0.35f);
-            draw_rect_outline(bx, by, box_w, box_h, 0.9f, 0.15f, 0.15f, 1.f);
-            // corner highlights (Zenin style)
-            float cl = box_w * 0.25f;
-            float cr = box_h * 0.1f;
-            // top-left
-            draw_line(bx, by, bx+cl, by, 1.f,1.f,1.f,0.9f);
-            draw_line(bx, by, bx, by+cr, 1.f,1.f,1.f,0.9f);
-            // top-right
-            draw_line(bx+box_w, by, bx+box_w-cl, by, 1.f,1.f,1.f,0.9f);
-            draw_line(bx+box_w, by, bx+box_w, by+cr, 1.f,1.f,1.f,0.9f);
-            // bottom-left
-            draw_line(bx, by+box_h, bx+cl, by+box_h, 1.f,1.f,1.f,0.9f);
-            draw_line(bx, by+box_h, bx, by+box_h-cr, 1.f,1.f,1.f,0.9f);
-            // bottom-right
-            draw_line(bx+box_w, by+box_h, bx+box_w-cl, by+box_h, 1.f,1.f,1.f,0.9f);
-            draw_line(bx+box_w, by+box_h, bx+box_w, by+box_h-cr, 1.f,1.f,1.f,0.9f);
+            void* health_gun = *(void**)((uintptr_t)peh + OFF_GuB_Health);
+            if ((uintptr_t)health_gun > 0x1000)
+                hp = *(float*)((uintptr_t)health_gun + OFF_GUN_float_value);
         }
+        if (name.empty()) name = "Player";
+        if (hp < 0.f || hp > 9999.f) hp = 0.f;
 
-        // health bar (left of box)
-        if (g_menu.esp_health && pi.max_health > 0.f) {
-            float frac = std::max(0.f, std::min(1.f, pi.health / pi.max_health));
-            float bar_x = bx - 5.f;
-            float bar_h = box_h * frac;
-            draw_rect_filled(bar_x, by, 3.f, box_h, 0.f, 0.f, 0.f, 0.6f);
-            // color: green→yellow→red based on health
-            float gr = 1.f - frac, gg = frac, gb = 0.f;
-            draw_rect_filled(bar_x, by + (box_h - bar_h), 3.f, bar_h, gr, gg, gb, 0.9f);
-        }
+        // Цвет: локальный игрок синий, остальные белые
+        float cr = (pm == local_copy) ? 0.3f : 1.f;
+        float cg = (pm == local_copy) ? 0.6f : 1.f;
+        float cb = (pm == local_copy) ? 1.f  : 1.f;
 
-        // name + hp text
-        if (g_menu.esp_name) {
-            char buf[80];
-            snprintf(buf, sizeof(buf), "%s [%.0f]", pi.display_name.c_str(), pi.health);
-            float scale = 1.5f;
-            float tw = text_width(buf, scale);
-            float tx = head_s.x - tw * 0.5f;
-            float ty = by - 12.f;
-            // shadow
-            draw_text(buf, tx+1, ty+1, scale, 0.f, 0.f, 0.f, 0.9f);
-            draw_text(buf, tx,   ty,   scale, 1.f, 1.f, 1.f, 1.f);
-        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s  %.0fhp", name.c_str(), hp);
 
-        // distance
-        {
-            char dbuf[16];
-            snprintf(dbuf, sizeof(dbuf), "%.0fm", dist);
-            float scale = 1.3f;
-            float tw = text_width(dbuf, scale);
-            draw_text(dbuf, feet_s.x - tw*0.5f, feet_s.y + 2.f, scale,
-                      0.9f, 0.9f, 0.9f, 0.85f);
-        }
+        // Полоска здоровья
+        float bar_w = 190.f * std::max(0.f, std::min(1.f, hp / 100.f));
+        draw_rect_filled(list_x - 2.f, list_y, 190.f, 2.f, 0.3f, 0.f, 0.f, 0.8f);
+        draw_rect_filled(list_x - 2.f, list_y, bar_w,  2.f, 0.f,  0.8f, 0.2f, 0.9f);
+
+        draw_text(buf, list_x, list_y + 3.f, 1.4f, cr, cg, cb, 1.f);
+        list_y += 20.f;
+        drawn++;
     }
 }
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Menu rendering  (BobaDLC External dark+red style)
@@ -898,17 +848,16 @@ static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     // init GL program once
     if (!g_gl_ready) {
         if (init_gl()) g_gl_ready = true;
-        // read screen size from camera or EGL
-        if (g_cam_pw && g_cam_getmain) {
-            void* cam = g_cam_getmain(nullptr);
-            if (cam) {
-                g_scr_w = g_cam_pw(cam, nullptr);
-                g_scr_h = g_cam_ph(cam, nullptr);
-                if (g_scr_w <= 0) g_scr_w = 1280;
-                if (g_scr_h <= 0) g_scr_h = 720;
-                LOGI("screen: %dx%d", g_scr_w, g_scr_h);
-            }
+        // читаем размер экрана через EGL — без IL2CPP вызовов
+        EGLDisplay cur_dpy  = eglGetCurrentDisplay();
+        EGLSurface cur_surf = eglGetCurrentSurface(EGL_DRAW);
+        if (cur_surf != EGL_NO_SURFACE) {
+            EGLint w = 0, h = 0;
+            eglQuerySurface(cur_dpy, cur_surf, EGL_WIDTH,  &w);
+            eglQuerySurface(cur_dpy, cur_surf, EGL_HEIGHT, &h);
+            if (w > 0 && h > 0) { g_scr_w = w; g_scr_h = h; }
         }
+        LOGI("screen via EGL: %dx%d", g_scr_w, g_scr_h);
     }
 
     if (g_gl_ready && g_prog) {
