@@ -53,19 +53,31 @@ static bool safe_read(uintptr_t addr, T& out) {
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(T);
 }
 
-// ── find lib base ─────────────────────────────────────────────────────────────
-static uintptr_t find_lib_base(const char* name) {
+// ── find load_bias for lib ────────────────────────────────────────────────────
+// load_bias = map_start - file_offset for the r-xp (executable) segment
+// RVA + load_bias = actual function address
+static uintptr_t find_load_bias(const char* name) {
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line)) {
         if (line.find(name) == std::string::npos) continue;
-        if (line.find("r--p") == std::string::npos &&
-            line.find("r-xp") == std::string::npos) continue;
-        uintptr_t start = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
-        uint32_t magic = 0;
-        if (safe_read(start, magic) && magic == 0x464C457F) return start;
+        if (line.find("r-xp") == std::string::npos) continue;
+        // parse: start-end perms offset dev inode path
+        uintptr_t start = strtoull(line.c_str(), nullptr, 16);
+        auto dash = line.find('-');
+        auto space = line.find(' ', dash);
+        auto space2 = line.find(' ', space+1);
+        auto space3 = line.find(' ', space2+1);
+        uintptr_t offset = strtoull(line.c_str() + space3 + 1, nullptr, 16);
+        uintptr_t bias = start - offset;
+        LOGI("load_bias for %s: 0x%lx (start=0x%lx offset=0x%lx)", name, bias, start, offset);
+        return bias;
     }
     return 0;
+}
+
+static uintptr_t find_lib_base(const char* name) {
+    return find_load_bias(name);
 }
 
 // ── valid pointer check ───────────────────────────────────────────────────────
