@@ -123,18 +123,27 @@ static void* find_csharp(void* domain) {
 
 static void cheat_main() {
     prctl(PR_SET_NAME, "UnityGfxDevice");
-    sleep(20);
+    sleep(25);
     LOGI("Starting");
 
     if (!load_symbols()) return;
 
-    void* domain = g_domain_get ? g_domain_get() : nullptr;
-    if (!domain && g_root_domain) domain = g_root_domain();
-    if (!domain) { LOGE("no domain"); return; }
-    LOGI("domain=%p", domain);
+    // Try root_domain first - safer than domain_get
+    void* domain = nullptr;
+    if (g_root_domain) {
+        domain = g_root_domain();
+        LOGI("root_domain=%p", domain);
+    }
+    if (!domain && g_domain_get) {
+        domain = g_domain_get();
+        LOGI("domain_get=%p", domain);
+    }
+    if (!domain || (uintptr_t)domain < 0x10000) { LOGE("no domain"); return; }
 
-    if (g_thread_attach) g_thread_attach(domain);
-    LOGI("attached");
+    if (g_thread_attach) {
+        void* thr = g_thread_attach(domain);
+        LOGI("attached thr=%p", thr);
+    }
 
     void* img = find_csharp(domain);
     if (!img) { LOGE("Assembly-CSharp not found"); return; }
