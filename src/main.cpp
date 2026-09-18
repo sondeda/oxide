@@ -186,26 +186,49 @@ static void cheat_main() {
     uintptr_t domain_get_addr = attach_addr - 0x574b280UL + 0x574ae18UL;
     LOGI("domain_get_addr=0x%lx", domain_get_addr);
     
-    // Read domain directly from memory at domain_get function
-    // mono_domain_get is 4 bytes - read what instruction is there
-    uint32_t insn = 0;
-    memcpy(&insn, (void*)domain_get_addr, 4);
-    LOGI("domain_get insn=0x%08x", insn);
+    // Call mono_domain_get directly and log result
+    // Previously returned 0x7990cbafc0 successfully
+    using fn_dg = void*(*)();
+    void* domain = ((fn_dg)domain_get_addr)();
+    LOGI("domain=%p", domain);
     
-    // Read 32 bytes around domain_get to find global var
-    uint8_t buf[32] = {};
-    memcpy(buf, (void*)domain_get_addr, 32);
-    LOGI("bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
-         buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]);
+    if (!domain || (uintptr_t)domain < 0x10000) {
+        // Try reading var at offset from ADRP+LDR
+        // target = domain_get_addr + B_offset
+        uint32_t b_insn = 0;
+        memcpy(&b_insn, (void*)domain_get_addr, 4);
+        int32_t imm26 = (int32_t)(b_insn << 6) >> 6;
+        uintptr_t target = domain_get_addr + (int64_t)imm26 * 4;
+        // ADRP at target+8
+        uint32_t adrp = 0, ldr = 0;
+        memcpy(&adrp, (void*)(target+8), 4);
+        memcpy(&ldr,  (void*)(target+12), 4);
+        int64_t immhi = (int32_t)(adrp & 0x00FFFFE0) >> 3;
+        int64_t immlo = (adrp >> 29) & 3;
+        uintptr_t page = ((target+8) & ~0xFFFULL) + ((immhi|immlo) << 12);
+        uint32_t imm12 = (ldr >> 10) & 0xFFF;
+        uintptr_t var = page + (uintptr_t)imm12 * 8;
+        LOGI("var=0x%lx", var);
+        memcpy(&domain, (void*)var, 8);
+        LOGI("domain_from_var=%p", domain);
+    }
     
-    // For now just run stable loop
-    void* domain = nullptr;
-    LOGI("stable — no crash");
+    if (domain && (uintptr_t)domain > 0x10000) {
+        LOGI("GOT DOMAIN: %p", domain);
+        // attach and find image
+        if (g_thread_attach) g_thread_attach(domain);
+        LOGI("attached");
+        void* img = find_csharp(domain);
+        if (img) LOGI("SUCCESS Assembly-CSharp: %p", img);
+        else LOGE("Assembly-CSharp not found");
+    } else {
+        LOGE("no domain");
+    }
     
     int tick = 0;
     while (true) {
         sleep(5);
-        if (++tick % 6 == 0) LOGI("stable tick=%d", tick);
+        if (++tick % 6 == 0) LOGI("tick=%d", tick);
     }
 
     if (g_thread_attach) g_thread_attach(domain);
