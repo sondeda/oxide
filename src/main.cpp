@@ -172,12 +172,16 @@ static void cheat_main() {
          (void*)g_thread_attach, (void*)g_corlib,
          (void*)g_asm_image, (void*)g_img_name);
 
-    // Read domain directly from global var — no function call
-    void* domain = read_root_domain_var(h);
-    LOGI("domain from var: %p", domain);
-    
+    // Poll domain var until Mono initializes (max 60 sec)
+    void* domain = nullptr;
+    for (int i = 0; i < 60; i++) {
+        domain = read_root_domain_var(h);
+        LOGI("domain poll[%d]: %p", i, domain);
+        if (domain && (uintptr_t)domain > 0x10000) break;
+        sleep(1);
+    }
     if (!domain || (uintptr_t)domain < 0x10000) {
-        LOGE("domain null — Mono not initialized yet?");
+        LOGE("domain never initialized");
         return;
     }
 
