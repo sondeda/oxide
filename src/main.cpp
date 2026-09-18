@@ -215,7 +215,7 @@ static void cheat_main() {
     if (!img) { LOGE("Assembly-CSharp not found"); return; }
     LOGI("SUCCESS img=%p", img);
 
-    int tick = 0;
+    
     while (true) {
         sleep(2);
         if (++tick % 10 == 0) LOGI("tick=%d", tick);
