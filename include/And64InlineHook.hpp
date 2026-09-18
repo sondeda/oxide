@@ -1,158 +1,105 @@
-// And64InlineHook v3 — ARM64, header-only
-// Стратегия "restore-call-repatch":
-// 1. Сохраняем оригинальные 16 байт функции
-// 2. Пишем наш jump патч
-// 3. orig = специальный трамплин который:
-//    a) убирает патч (восстанавливает оригинальные байты)
-//    b) вызывает оригинальную функцию
-//    c) ставит патч обратно
-// Это работает с ЛЮБЫМИ инструкциями включая ADRP.
-// Недостаток: не thread-safe при одновременных вызовах.
-// Для Unity single-thread lifecycle методов (Awake/OnEnable/OnDisable) — ОК.
+// And64InlineHook v4 — без ручного ARM64 asm, без трамплинов
+// Стратегия: храним оригинальные байты и вызываем оригинал через
+// временный unmap/remap. Orig-указатель это просто структура с callback.
+// Для вызова оригинала из хука используем глобальный массив.
+//
+// КАК РАБОТАЕТ:
+// - A64HookFunction(target, hook, &orig_fn_ptr)
+// - orig_fn_ptr = специальная функция-обёртка которая:
+//     1. снимает патч с target (восстанавливает оригинальные байты)
+//     2. вызывает target напрямую
+//     3. возвращает патч обратно
+// - Всё через C++ function pointers — никакого ручного ASM
 
 #pragma once
 #include <cstdint>
 #include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
-struct A64HookEntry {
-    void*   target;
-    uint8_t orig_bytes[16];   // оригинальные инструкции
-    uint8_t patch_bytes[16];  // наш jump патч
-    bool    patched;
+#define A64_MAX_HOOKS 8
+
+struct _A64Entry {
+    uint8_t* target;
+    uint8_t  orig[16];
+    uint8_t  patch[16];
+    pthread_mutex_t mtx;
+    bool active;
 };
 
-static A64HookEntry _a64_entries[16];
-static int          _a64_entry_count = 0;
+static _A64Entry _a64_tbl[A64_MAX_HOOKS];
+static int       _a64_cnt = 0;
 
-// Трамплин-функции (по одной на каждый хук, до 8 штук)
-// Каждый трамплин: снимает патч → вызывает orig → ставит патч обратно
-// Генерируем их динамически в пуле
-
-static uint8_t  _a64_pool[4096] __attribute__((aligned(4096)));
-static uint32_t _a64_pool_off = 0;
-static bool     _a64_pool_ready = false;
-
-static inline void _a64_mprotect(void* addr, size_t len, int prot) {
-    long pgsz = getpagesize();
-    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(pgsz - 1);
-    mprotect((void*)start, (size_t)((uintptr_t)addr - start) + len + (size_t)pgsz, prot);
+static void _a64_protect(void* p, int prot) {
+    uintptr_t pg = (uintptr_t)p & ~(uintptr_t)(getpagesize()-1);
+    mprotect((void*)pg, (size_t)getpagesize() * 2, prot);
 }
 
-static inline void _a64_write_abs_jump(void* where, uintptr_t target_addr) {
-    uint32_t* p = (uint32_t*)where;
-    p[0] = 0x58000051u; // LDR X17, #8
-    p[1] = 0xD61F0220u; // BR X17
-    *(uintptr_t*)(p + 2) = target_addr;
+// Вызов оригинальной функции по индексу
+// Используется как: ((fn_t)_a64_call_orig)(idx, __this, method)
+// idx передаётся через глобальную переменную перед вызовом (см. ниже)
+// 
+// Нет — проще: делаем 8 отдельных C++ функций, по одной на каждый хук.
+// Каждая знает свой индекс через замыкание.
+
+typedef void(*_a64_void_fn)(void*, void*);
+
+static void _a64_call(int idx, void* a, void* b) {
+    _A64Entry& e = _a64_tbl[idx];
+    pthread_mutex_lock(&e.mtx);
+    _a64_protect(e.target, PROT_READ|PROT_WRITE|PROT_EXEC);
+    memcpy(e.target, e.orig, 16);
+    __builtin___clear_cache((char*)e.target, (char*)e.target+16);
+    ((_a64_void_fn)e.target)(a, b);
+    memcpy(e.target, e.patch, 16);
+    __builtin___clear_cache((char*)e.target, (char*)e.target+16);
+    _a64_protect(e.target, PROT_READ|PROT_EXEC);
+    pthread_mutex_unlock(&e.mtx);
 }
 
-// C-функция которую вызывает каждый трамплин
-// Снимает патч, вызывает оригинал, ставит патч обратно
-// entry_idx — индекс в _a64_entries
-#include <pthread.h>
-static pthread_mutex_t _a64_mutex[16];
-static bool _a64_mutex_init = false;
+// 8 статических обёрток — каждая для своего слота
+static void _a64_orig0(void* a,void* b){_a64_call(0,a,b);}
+static void _a64_orig1(void* a,void* b){_a64_call(1,a,b);}
+static void _a64_orig2(void* a,void* b){_a64_call(2,a,b);}
+static void _a64_orig3(void* a,void* b){_a64_call(3,a,b);}
+static void _a64_orig4(void* a,void* b){_a64_call(4,a,b);}
+static void _a64_orig5(void* a,void* b){_a64_call(5,a,b);}
+static void _a64_orig6(void* a,void* b){_a64_call(6,a,b);}
+static void _a64_orig7(void* a,void* b){_a64_call(7,a,b);}
 
-extern "C" void _a64_restore_call(int entry_idx, void* __this, void* method) {
-    if (!_a64_mutex_init) {
-        for (int i = 0; i < 16; i++) pthread_mutex_init(&_a64_mutex[i], nullptr);
-        _a64_mutex_init = true;
-    }
-    A64HookEntry& e = _a64_entries[entry_idx];
-    pthread_mutex_lock(&_a64_mutex[entry_idx]);
-    // снять патч
-    _a64_mprotect(e.target, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
-    memcpy(e.target, e.orig_bytes, 16);
-    __builtin___clear_cache((char*)e.target, (char*)e.target + 16);
-    // вызвать оригинал
-    using fn_t = void(*)(void*, void*);
-    ((fn_t)e.target)(__this, method);
-    // поставить патч обратно
-    memcpy(e.target, e.patch_bytes, 16);
-    __builtin___clear_cache((char*)e.target, (char*)e.target + 16);
-    _a64_mprotect(e.target, 16, PROT_READ | PROT_EXEC);
-    pthread_mutex_unlock(&_a64_mutex[entry_idx]);
-}
-
-// Трамплин-stub для каждого хука (ARM64 asm)
-// Вызывает _a64_restore_call(idx, x0, x1)
-// x0 и x1 уже содержат __this и method (первые два аргумента функции)
-static void* _a64_make_trampoline(int idx) {
-    if (!_a64_pool_ready) {
-        _a64_mprotect(_a64_pool, sizeof(_a64_pool), PROT_READ | PROT_WRITE | PROT_EXEC);
-        _a64_pool_ready = true;
-    }
-    if (_a64_pool_off + 64 > sizeof(_a64_pool)) return nullptr;
-    uint32_t* t = (uint32_t*)(_a64_pool + _a64_pool_off);
-    _a64_pool_off += 64;
-
-    // ARM64:
-    // STP X0, X1, [SP, #-32]!   ; сохраняем x0 (this) и x1 (method)
-    // STP X29, X30, [SP, #16]   ; сохраняем fp и lr
-    // MOV W0, #idx              ; первый аргумент = idx
-    // LDP X1, X2, [SP]          ; восстанавливаем __this в x1, method в x2
-    //   (но _a64_restore_call принимает int, void*, void*)
-    // нет, проще:
-    // сохраняем x0,x1,x29,x30
-    // x2 = x1 (method), x1 = x0 (__this), x0 = idx
-    // вызываем _a64_restore_call
-    // восстанавливаем x29,x30
-    // RET
-
-    // STP X29, X30, [SP, #-32]!
-    t[0]  = 0xA9BE7BFDU;
-    // STP X0, X1, [SP, #16]
-    t[1]  = 0xA9010FE0U;
-    // MOV X2, X1  (method → x2)
-    t[2]  = 0xAA0103E2U;
-    // MOV X1, X0  (__this → x1)
-    t[3]  = 0xAA0003E1U;
-    // MOV W0, #idx
-    t[4]  = 0x52800000U | ((uint32_t)(idx & 0xFFFF) << 5);
-    // LDR X16, #24  (загружаем адрес _a64_restore_call из literal pool)
-    t[5]  = 0x58000190U;
-    // BLR X16
-    t[6]  = 0xD63F0200U;
-    // LDP X0, X1, [SP, #16]  (не нужно восстанавливать x0/x1 — void return)
-    // LDP X29, X30, [SP], #32
-    t[7]  = 0xA8C27BFDU;
-    // RET
-    t[8]  = 0xD65F03C0U;
-    // literal: адрес _a64_restore_call (8 байт)
-    *(uintptr_t*)(t + 9) = (uintptr_t)_a64_restore_call;
-
-    __builtin___clear_cache((char*)t, (char*)t + 64);
-    return (void*)t;
-}
+static _a64_void_fn _a64_origs[A64_MAX_HOOKS] = {
+    _a64_orig0,_a64_orig1,_a64_orig2,_a64_orig3,
+    _a64_orig4,_a64_orig5,_a64_orig6,_a64_orig7
+};
 
 static bool A64HookFunction(void* target, void* hook, void** orig) {
     if (!target || !hook) return false;
-    if (_a64_entry_count >= 16) return false;
+    if (_a64_cnt >= A64_MAX_HOOKS) return false;
 
-    int idx = _a64_entry_count++;
-    A64HookEntry& e = _a64_entries[idx];
-    e.target  = target;
-    e.patched = false;
+    int idx = _a64_cnt++;
+    _A64Entry& e = _a64_tbl[idx];
+    e.target = (uint8_t*)target;
+    e.active = true;
+    pthread_mutex_init(&e.mtx, nullptr);
 
     // сохраняем оригинальные 16 байт
-    memcpy(e.orig_bytes, target, 16);
+    memcpy(e.orig, target, 16);
 
-    // строим патч (jump к hook)
-    _a64_write_abs_jump(e.patch_bytes, (uintptr_t)hook);
+    // строим патч: LDR X17, #8; BR X17; .quad hook
+    uint32_t* p = (uint32_t*)e.patch;
+    p[0] = 0x58000051u; // LDR X17, #8
+    p[1] = 0xD61F0220u; // BR X17
+    *(uint64_t*)(p+2) = (uint64_t)(uintptr_t)hook;
 
     // ставим патч
-    _a64_mprotect(target, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
-    memcpy(target, e.patch_bytes, 16);
-    __builtin___clear_cache((char*)target, (char*)target + 16);
-    _a64_mprotect(target, 16, PROT_READ | PROT_EXEC);
-    e.patched = true;
+    _a64_protect(target, PROT_READ|PROT_WRITE|PROT_EXEC);
+    memcpy(target, e.patch, 16);
+    __builtin___clear_cache((char*)target, (char*)target+16);
+    _a64_protect(target, PROT_READ|PROT_EXEC);
 
-    // создаём трамплин для вызова оригинала
-    if (orig) {
-        void* tramp = _a64_make_trampoline(idx);
-        *orig = tramp;
-    }
+    // orig указывает на статическую обёртку
+    if (orig) *orig = (void*)_a64_origs[idx];
 
     return true;
 }
