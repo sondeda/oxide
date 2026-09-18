@@ -769,33 +769,33 @@ static std::atomic<bool> g_touch_menu_toggle{false}; // сигнал из тре
 
 // Найти все /dev/input/eventX которые репортят ABS_MT_POSITION
 static std::vector<std::string> find_touch_devices() {
+    // Сначала пробуем найти через /proc/bus/input/devices — более надёжно
     std::vector<std::string> result;
-    DIR* d = opendir("/dev/input");
-    if (!d) return result;
-    struct dirent* e;
-    while ((e = readdir(d))) {
-        if (strncmp(e->d_name, "event", 5) != 0) continue;
-        std::string path = std::string("/dev/input/") + e->d_name;
-        int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+    // Пробуем все event0..event9 напрямую
+    for (int i = 0; i < 15; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
-        // проверяем что устройство поддерживает EV_ABS + ABS_MT_POSITION_X
         uint8_t evbits[EV_MAX / 8 + 1] = {};
         if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) >= 0) {
-            if (evbits[EV_ABS / 8] & (1 << (EV_ABS % 8))) {
+            bool has_abs = (evbits[EV_ABS / 8] & (1 << (EV_ABS % 8))) != 0;
+            if (has_abs) {
                 uint8_t absbits[ABS_MAX / 8 + 1] = {};
-                if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0) {
-                    if (absbits[ABS_MT_POSITION_X / 8] & (1 << (ABS_MT_POSITION_X % 8))) {
-                        result.push_back(path);
-                        LOGI("touch device: %s", path.c_str());
-                    }
+                ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+                bool has_mt = (absbits[ABS_MT_POSITION_X / 8] & (1 << (ABS_MT_POSITION_X % 8))) != 0;
+                bool has_abs_x = (absbits[ABS_X / 8] & (1 << (ABS_X % 8))) != 0;
+                if (has_mt || has_abs_x) {
+                    result.push_back(std::string(path));
+                    LOGI("touch device found: %s", path);
                 }
             }
         }
         close(fd);
     }
-    closedir(d);
     return result;
 }
+// _REPLACED_OLD_FIND_
 
 static void touch_reader_thread() {
     // ждём пока игра поднимется
@@ -924,6 +924,9 @@ static fn_pm_void g_orig_on_disable = nullptr;
 
 static void hooked_Awake(void* __this, void* method) {
     // Call original first — lets Unity initialize the component
+    // orig может быть nullptr если ADRP-relocation не удалась — в этом случае
+    // компонент инициализируется самой Unity после возврата из хука (хук заменяет функцию)
+    // но для Awake это критично — пробуем вызвать оригинал только если он есть
     if (g_orig_awake) g_orig_awake(__this, method);
 
     LOGI("Awake HIT! this=%p", __this);
