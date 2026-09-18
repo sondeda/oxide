@@ -1,4 +1,5 @@
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <jni.h>
 #include <android/log.h>
 #include <unistd.h>
@@ -7,6 +8,8 @@
 #include <thread>
 #include <fstream>
 #include <cstring>
+#include <signal.h>
+#include <setjmp.h>
 #include "zygisk.hpp"
 
 #define TAG "OxideCheat"
@@ -14,45 +17,41 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // ── RVAs from readelf ─────────────────────────────────────────────────────────
-#define RVA_domain_get          0x574ae18UL
-#define RVA_root_domain         0x574ae14UL
-#define RVA_thread_attach       0x574b280UL
-#define RVA_assemblies_iter     0x574ae54UL
-#define RVA_assembly_get_image  0x574ae0cUL
-#define RVA_image_get_name      0x574ae10UL
-#define RVA_image_get_entry     0x574adddcUL
-#define RVA_class_get_checked   0x574b440UL
-#define RVA_class_get_name      0x574b098UL
-#define RVA_class_get_namespace 0x574b094UL
-#define RVA_class_num_fields    0x574b030UL
-#define RVA_field_get_name      0x574b230UL
-#define RVA_field_get_offset    0x574b23cUL
-#define RVA_field_set_value     0x574b234UL
-#define RVA_class_instance_size 0x574b00cUL
+#define RVA_domain_get      0x574ae18UL
+#define RVA_root_domain     0x574ae14UL
+#define RVA_thread_attach   0x574b280UL
+#define RVA_corlib          0x574ae44UL
+#define RVA_assembly_image  0x574ae0cUL
+#define RVA_image_name      0x574ae10UL
+#define RVA_class_checked   0x574b440UL
+#define RVA_class_name      0x574b098UL
+#define RVA_class_namespace 0x574b094UL
+#define RVA_num_fields      0x574b030UL
+#define RVA_field_name      0x574b230UL
+#define RVA_field_offset    0x574b23cUL
+#define RVA_field_set       0x574b234UL
 
-// TypeDefIndex from dump: PlayerManager = 9223 → token = 0x02002409
-// GenericVitals = 8856 → 0x02002298
-// PlayerVitals = 8867 → 0x020022A3
-#define TOKEN_PlayerManager     0x02002409U
-#define TOKEN_GenericVitals     0x02002298U
-
-// ── function types ────────────────────────────────────────────────────────────
-using fn_v_v   = void*(*)();
-using fn_v_p   = void*(*)(void*);
-using fn_iter  = void*(*)(void*, void**);
-using fn_name  = const char*(*)(void*);
-using fn_class_checked = void*(*)(void*, uint32_t, int*); // image, token, error
-using fn_num_f = int(*)(void*);
-using fn_fname = const char*(*)(void*);
-using fn_foff  = int(*)(void*);
-using fn_fset  = void(*)(void*, void*, void*);
-using fn_isize = int(*)(void*);
+using fn_vv   = void*(*)();
+using fn_vp   = void*(*)(void*);
+using fn_name = const char*(*)(void*);
+using fn_cc   = void*(*)(void*, uint32_t, int*);
+using fn_nf   = int(*)(void*);
+using fn_fn   = const char*(*)(void*);
+using fn_fo   = int(*)(void*);
+using fn_fs   = void(*)(void*,void*,void*);
+using fn_ta   = void*(*)(void*);
 
 static uintptr_t g_base = 0;
 #define FN(type, rva) ((type)(g_base + (rva)))
 
-// ── Vec3 ──────────────────────────────────────────────────────────────────────
-struct Vec3 { float x, y, z; };
+// ── safe memory read via process_vm_readv ─────────────────────────────────────
+template<typename T>
+static bool safe_read(uintptr_t addr, T& out) {
+    if (addr < 0x10000 || addr > 0x7fffffffffff) return false;
+    struct iovec local  = { &out,    sizeof(T) };
+    struct iovec remote = { (void*)addr, sizeof(T) };
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(T);
+}
 
 // ── find lib base ─────────────────────────────────────────────────────────────
 static uintptr_t find_lib_base(const char* name) {
@@ -63,188 +62,117 @@ static uintptr_t find_lib_base(const char* name) {
         if (line.find("r--p") == std::string::npos &&
             line.find("r-xp") == std::string::npos) continue;
         uintptr_t start = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
-        if (*(uint32_t*)start == 0x464C457F) return start;
+        uint32_t magic = 0;
+        if (safe_read(start, magic) && magic == 0x464C457F) return start;
     }
     return 0;
 }
 
-// ── safe read ─────────────────────────────────────────────────────────────────
-template<typename T>
-static T rd(uintptr_t addr) {
-    if (addr < 0x10000) return T{};
-    T v{};
-    memcpy(&v, (void*)addr, sizeof(T));
-    return v;
-}
-
-// ── find Assembly-CSharp ──────────────────────────────────────────────────────
-static void* g_image = nullptr;
-
-struct GSList { void* data; GSList* next; };
-
-static bool vptr(void* p) {
-    uintptr_t v = (uintptr_t)p;
+// ── valid pointer check ───────────────────────────────────────────────────────
+static bool vptr(uintptr_t v) {
     return v > 0x10000 && v < 0x7fffffffffff;
 }
 
-static bool valid_str(const char* s) {
-    if (!vptr((void*)s)) return false;
-    for (int i = 0; i < 128; i++) {
-        if (s[i] == 0) return i > 0;
-        if ((unsigned char)s[i] > 127) return false;
+// ── valid string check ────────────────────────────────────────────────────────
+static bool valid_str(uintptr_t addr) {
+    if (!vptr(addr)) return false;
+    char buf[128];
+    struct iovec l = { buf, 128 };
+    struct iovec r = { (void*)addr, 128 };
+    if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) <= 0) return false;
+    for (int i = 0; i < 127; i++) {
+        if (buf[i] == 0) return i > 0;
+        if ((unsigned char)buf[i] > 127) return false;
     }
     return false;
 }
 
-// mono_domain_get_assemblies_iter(domain, include_unref) -> GSList*
-// Get Assembly-CSharp image via corlib + class token trick
-// mono_domain_get_corlib returns mscorlib image safely
-// Then we use mono_class_get_checked with PlayerManager token on Assembly-CSharp
-// We find Assembly-CSharp by trying PlayerManager token (TypeDefIndex 9223 = 0x02002409)
-// on images reachable from domain->domain_assemblies GSList at fixed offsets
+struct GSList { void* data; GSList* next; };
 
+// ── find Assembly-CSharp ──────────────────────────────────────────────────────
 static void* find_csharp_image(void* domain) {
-    // Try corlib first to confirm mono API works
-    using fn_corlib = void*(*)(void*);
-    auto corlib_fn = FN(fn_corlib, 0x574ae44UL); // mono_domain_get_corlib
-    void* corlib = corlib_fn(domain);
+    auto img_fn  = FN(fn_vp,   RVA_assembly_image);
+    auto name_fn = FN(fn_name, RVA_image_name);
+
+    // Try corlib to confirm domain works
+    auto corlib_fn = FN(fn_vv, RVA_corlib);
+    void* corlib = corlib_fn();
     LOGI("corlib: %p", corlib);
 
-    // Now try to find Assembly-CSharp by scanning domain+0x58 (typical GSList offset)
-    // Safe approach: only dereference if pointer looks valid
-    auto img_fn  = FN(fn_v_p,  RVA_assembly_get_image);
-    auto name_fn = FN(fn_name, RVA_image_get_name);
+    // Scan domain offsets 0x40..0xC0 for GSList of assemblies
+    for (int off = 0x40; off <= 0xC0; off += 8) {
+        uintptr_t list_addr = 0;
+        if (!safe_read((uintptr_t)domain + off, list_addr)) continue;
+        if (!vptr(list_addr)) continue;
 
-    // MonoDomain in Unity Mono: loaded_assemblies at +0x58 or +0x60
-    for (int off = 0x50; off <= 0x80; off += 8) {
-        void* raw = *(void**)((uintptr_t)domain + off);
-        if (!vptr(raw)) continue;
-
-        // First node data
-        void* first_data = *(void**)((uintptr_t)raw);
+        // Check if this looks like a GSList by reading first node
+        uintptr_t first_data = 0;
+        if (!safe_read(list_addr, first_data)) continue;
         if (!vptr(first_data)) continue;
 
-        // Try as assembly
-        void* img = img_fn(first_data);
-        if (!img || !vptr(img)) continue;
+        // Try calling img_fn on first_data
+        void* test_img = img_fn((void*)first_data);
+        uintptr_t test_img_v = (uintptr_t)test_img;
+        if (!vptr(test_img_v)) continue;
 
-        // Walk the list safely - max 64 assemblies
-        auto* node = (GSList*)raw;
-        for (int i = 0; i < 64 && node && vptr(node); i++) {
-            void* data = node->data;
-            if (!vptr(data)) { node = node->next; continue; }
-            void* nimg = img_fn(data);
-            if (!nimg || !vptr(nimg)) { node = node->next; continue; }
-            const char* name = name_fn(nimg);
-            if (!valid_str(name)) { node = node->next; continue; }
-            LOGI("off=0x%x [%d] %s", off, i, name);
-            if (strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
-                return nimg;
-            node = node->next;
+        // Looks like a valid assembly list — walk it
+        uintptr_t node_addr = list_addr;
+        for (int i = 0; i < 128; i++) {
+            uintptr_t data = 0, next = 0;
+            if (!safe_read(node_addr, data)) break;
+            if (!safe_read(node_addr + 8, next)) break;
+            if (!vptr(data)) { if (!vptr(next)) break; node_addr = next; continue; }
+
+            void* img = img_fn((void*)data);
+            if (!img || !vptr((uintptr_t)img)) { node_addr = next; continue; }
+
+            uintptr_t name_ptr = 0;
+            if (!safe_read((uintptr_t)img + 0x10, name_ptr) || !valid_str(name_ptr)) {
+                // try calling name_fn
+                const char* name = name_fn(img);
+                if (name && valid_str((uintptr_t)name)) {
+                    LOGI("off=0x%x [%d] %s", off, i, name);
+                    if (strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
+                        return img;
+                }
+                node_addr = next;
+                continue;
+            }
+
+            LOGI("off=0x%x [%d] ptr=0x%lx", off, i, name_ptr);
+            node_addr = next;
+            if (!vptr(next)) break;
         }
     }
     LOGE("Assembly-CSharp not found");
     return nullptr;
 }
 
-// ── find PlayerManager class via token ───────────────────────────────────────
-static void* find_class_by_token(void* image, uint32_t token) {
-    auto fn = FN(fn_class_checked, RVA_class_get_checked);
-    int err = 0;
-    void* klass = fn(image, token, &err);
-    if (!klass || err) {
-        LOGE("class token 0x%x failed err=%d", token, err);
-        return nullptr;
-    }
-    auto name_fn = FN(fn_name, RVA_class_get_name);
-    LOGI("class: %s", name_fn(klass));
-    return klass;
-}
-
-// ── find field offset by name ─────────────────────────────────────────────────
-static int find_field_offset(void* klass, const char* fname) {
-    auto num_fn  = FN(fn_num_f, RVA_class_num_fields);
-    auto name_fn = FN(fn_fname, RVA_field_get_name);
-    auto off_fn  = FN(fn_foff,  RVA_field_get_offset);
-
-    // mono_class_get_fields iterator: pass void* iter starting at nullptr
-    // We don't have mono_class_get_fields directly — use num_fields + offset walk
-    // mono_class stores fields in klass->fields array at known offset
-    // In Mono: MonoClassField* fields at klass+0x98 (typical)
-    // Each MonoClassField: type(0x0), name(0x8), parent(0x10), offset(0x18)
-    struct MonoField { void* type; const char* name; void* parent; int32_t offset; int32_t extra; };
-
-    int num = num_fn(klass);
-    LOGI("class has %d fields", num);
-
-    // fields ptr at klass+0x98 in typical Mono layout
-    for (int field_off = 0x80; field_off <= 0xC0; field_off += 8) {
-        void* fields_ptr = rd<void*>((uintptr_t)klass + field_off);
-        if (!fields_ptr || (uintptr_t)fields_ptr < 0x10000) continue;
-
-        for (int i = 0; i < num && i < 200; i++) {
-            auto* f = (MonoField*)((uintptr_t)fields_ptr + i * sizeof(MonoField));
-            if (!f->name || (uintptr_t)f->name < 0x10000) continue;
-            char name_buf[64] = {};
-            memcpy(name_buf, f->name, 63);
-            if (strcmp(name_buf, fname) == 0) {
-                LOGI("field %s offset=0x%x", fname, f->offset);
-                return f->offset;
-            }
-        }
-    }
-    LOGE("field %s not found", fname);
-    return -1;
-}
-
-// ── ESP tick ──────────────────────────────────────────────────────────────────
-static int g_apl_offset = -1;   // activePlayerList static field offset
-static int g_peh_offset = -1;   // playerEventHandler field offset
-static int g_vit_offset = -1;   // vitals field offset
-
-static void esp_tick(void* klass_pm) {
-    if (g_peh_offset < 0) {
-        g_peh_offset = find_field_offset(klass_pm, "playerEventHandler");
-        g_vit_offset = find_field_offset(klass_pm, "vitals");
-        if (g_peh_offset < 0) return;
-    }
-
-    // read activePlayerList static — it's at known offset from the class static data
-    // For now log that we're scanning
-    LOGI("ESP: peh_off=0x%x vit_off=0x%x", g_peh_offset, g_vit_offset);
-}
-
-// ── main cheat thread ─────────────────────────────────────────────────────────
+// ── main thread ───────────────────────────────────────────────────────────────
 static void cheat_main() {
-    sleep(5);
+    sleep(15);
     LOGI("Starting");
 
     g_base = find_lib_base("libil2cpp.so");
     if (!g_base) { LOGE("base not found"); return; }
     LOGI("base: 0x%lx", g_base);
 
-    void* domain = FN(fn_v_v, RVA_domain_get)();
-    if (!domain) domain = FN(fn_v_v, RVA_root_domain)();
+    void* domain = FN(fn_vv, RVA_domain_get)();
+    if (!domain) domain = FN(fn_vv, RVA_root_domain)();
     if (!domain) { LOGE("no domain"); return; }
     LOGI("domain: %p", domain);
 
-    FN(fn_v_p, RVA_thread_attach)(domain);
+    FN(fn_ta, RVA_thread_attach)(domain);
     LOGI("thread attached");
 
     void* img = find_csharp_image(domain);
     if (!img) { LOGE("image not found"); return; }
-    LOGI("Assembly-CSharp: %p", img);
-
-    void* klass_pm = find_class_by_token(img, TOKEN_PlayerManager);
-    if (!klass_pm) { LOGE("PlayerManager not found"); return; }
-    LOGI("PlayerManager: %p", klass_pm);
-
-    LOGI("SUCCESS — all classes resolved");
+    LOGI("SUCCESS Assembly-CSharp: %p", img);
 
     int tick = 0;
     while (true) {
-        sleep(1);
-        if (++tick % 10 == 0) esp_tick(klass_pm);
+        sleep(2);
+        if (++tick % 5 == 0) LOGI("running tick=%d", tick);
     }
 }
 
