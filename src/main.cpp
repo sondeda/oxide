@@ -172,16 +172,33 @@ static void cheat_main() {
          (void*)g_thread_attach, (void*)g_corlib,
          (void*)g_asm_image, (void*)g_img_name);
 
-    // Poll domain var until Mono initializes (max 60 sec)
+    // Find var addr once, then poll it
+    uintptr_t domain_var_addr = 0;
+    {
+        // temp call to get the var address
+        // we modify read_root_domain_var to also store the addr
+    }
+    
+    // Use mono_domain_get RVA directly - this worked before (returned 0x7990cbafc0)
+    // RVA 0x574ae18 verified from readelf
+    // Calculate actual address: attach addr - attach_rva + domain_rva  
+    uintptr_t attach_addr = (uintptr_t)g_thread_attach;
+    uintptr_t domain_get_addr = attach_addr - 0x574b280UL + 0x574ae18UL;
+    LOGI("domain_get_addr=0x%lx", domain_get_addr);
+    
+    using fn_domain_get = void*(*)();
     void* domain = nullptr;
-    for (int i = 0; i < 60; i++) {
-        domain = read_root_domain_var(h);
-        LOGI("domain poll[%d]: %p", i, domain);
-        if (domain && (uintptr_t)domain > 0x10000) break;
+    for (int i = 0; i < 120; i++) {
+        domain = ((fn_domain_get)domain_get_addr)();
+        if (domain && (uintptr_t)domain > 0x10000) {
+            LOGI("domain at poll[%d]: %p", i, domain);
+            break;
+        }
+        if (i % 10 == 0) LOGI("waiting... [%d] domain=%p", i, domain);
         sleep(1);
     }
     if (!domain || (uintptr_t)domain < 0x10000) {
-        LOGE("domain never initialized");
+        LOGE("domain never ready");
         return;
     }
 
