@@ -186,20 +186,26 @@ static void cheat_main() {
     uintptr_t domain_get_addr = attach_addr - 0x574b280UL + 0x574ae18UL;
     LOGI("domain_get_addr=0x%lx", domain_get_addr);
     
-    using fn_domain_get = void*(*)();
+    // Read domain directly from memory at domain_get function
+    // mono_domain_get is 4 bytes - read what instruction is there
+    uint32_t insn = 0;
+    memcpy(&insn, (void*)domain_get_addr, 4);
+    LOGI("domain_get insn=0x%08x", insn);
+    
+    // Read 32 bytes around domain_get to find global var
+    uint8_t buf[32] = {};
+    memcpy(buf, (void*)domain_get_addr, 32);
+    LOGI("bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+         buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]);
+    
+    // For now just run stable loop
     void* domain = nullptr;
-    for (int i = 0; i < 120; i++) {
-        domain = ((fn_domain_get)domain_get_addr)();
-        if (domain && (uintptr_t)domain > 0x10000) {
-            LOGI("domain at poll[%d]: %p", i, domain);
-            break;
-        }
-        if (i % 10 == 0) LOGI("waiting... [%d] domain=%p", i, domain);
-        sleep(1);
-    }
-    if (!domain || (uintptr_t)domain < 0x10000) {
-        LOGE("domain never ready");
-        return;
+    LOGI("stable — no crash");
+    
+    int tick = 0;
+    while (true) {
+        sleep(5);
+        if (++tick % 6 == 0) LOGI("stable tick=%d", tick);
     }
 
     if (g_thread_attach) g_thread_attach(domain);
