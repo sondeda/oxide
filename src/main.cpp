@@ -1,5 +1,17 @@
+// language: C++17, file: src/main.cpp, target: Android arm64-v8a, Unity IL2CPP (Oxide)
+// build: CMakeLists.txt (add EGL + GLESv2 to target_link_libraries)
+//
+// Architecture:
+//   1. shadowhook loaded from libshadowhook.so (already in game process)
+//   2. Hook PlayerManager::Awake   — inject confirmation
+//   3. Hook PlayerManager::OnEnable  — add player to tracked list
+//   4. Hook PlayerManager::OnDisable — remove from list
+//   5. Hook eglSwapBuffers — render ESP + menu (render thread = Unity's own thread)
+//   6. Inside render hook: call Camera::get_main() + WorldToScreenPoint() by RVA (safe — render thread is attached)
+//   7. Read player data by direct field offsets (no Mono API, no crash)
+
 #include <sys/types.h>
-#include <sys/prctl.h>
+#include <sys/stat.h>
 #include <jni.h>
 #include <android/log.h>
 #include <unistd.h>
@@ -8,261 +20,1056 @@
 #include <thread>
 #include <fstream>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <cmath>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <atomic>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 #include "zygisk.hpp"
 
-#define TAG "OxideCheat"
+// ─────────────────────────────────────────────────────────────────────────────
+// Logging
+// ─────────────────────────────────────────────────────────────────────────────
+#define TAG  "LotusorCheat"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-using fn_vv = void*(*)();
-using fn_vp = void*(*)(void*);
-using fn_nm = const char*(*)(void*);
-using fn_ta = void*(*)(void*);
+// ─────────────────────────────────────────────────────────────────────────────
+// RVAs confirmed from Dump0/script.json + dump.cs (do NOT change)
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr uintptr_t RVA_PM_Awake         = 0x6685fd4UL;
+static constexpr uintptr_t RVA_PM_OnEnable      = 0x66730a8UL;
+static constexpr uintptr_t RVA_PM_OnDisable     = 0x667bd7cUL;
+static constexpr uintptr_t RVA_PM_Update        = 0x6684014UL;
+static constexpr uintptr_t RVA_Cam_GetMain      = 0xc73b4ecUL; // static, no __this
+static constexpr uintptr_t RVA_Cam_W2S          = 0xc73aa40UL; // (Camera*, Vec3, MethodInfo*)->Vec3
 
-static fn_ta g_thread_attach = nullptr;
-static fn_vp g_corlib        = nullptr;
-static fn_vp g_asm_image     = nullptr;
-static fn_nm g_img_name      = nullptr;
+// ─────────────────────────────────────────────────────────────────────────────
+// PlayerManager field offsets (from dump.cs TypeDefIndex: 9223)
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr uintptr_t OFF_PM_playerEventHandler = 0x78;  // Gum*  (extends GuB which has DisplayName+Health)
+static constexpr uintptr_t OFF_PM_vitals             = 0xC8;  // PlayerVitals*
+static constexpr uintptr_t OFF_PM_lastTickPosition   = 0x1C8; // Vector3 (server position, close enough for ESP)
+static constexpr uintptr_t OFF_PM_userID             = 0x278; // Il2CppString*
+static constexpr uintptr_t OFF_PM_isImmortal         = 0x2B1; // bool
+static constexpr uintptr_t OFF_PM_prime              = 0x254; // bool
 
-static std::string find_il2cpp_path() {
-    std::ifstream f("/proc/self/maps");
+// GuB (base of Gum/playerEventHandler) field offsets
+static constexpr uintptr_t OFF_GuB_DisplayName = 0x88;  // Il2CppString*
+static constexpr uintptr_t OFF_GuB_Health      = 0x98;  // Gun<float,?>* (heap obj)
+static constexpr uintptr_t OFF_GUN_float_value = 0x18;  // float LMj inside Gun<float,?> object
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IL2CPP struct helpers
+// ─────────────────────────────────────────────────────────────────────────────
+struct Vec3 { float x, y, z; };
+struct Vec2 { float x, y; };
+
+// Il2CppString: [klass 8][monitor 8][length 4][chars ...]
+static std::string read_il2cpp_string(void* str_ptr) {
+    if (!str_ptr) return "";
+    int32_t len = *(int32_t*)((uintptr_t)str_ptr + 0x10);
+    if (len <= 0 || len > 128) return "";
+    const uint16_t* chars = (const uint16_t*)((uintptr_t)str_ptr + 0x14);
+    std::string out;
+    out.reserve((size_t)len);
+    for (int i = 0; i < len; i++) {
+        uint16_t c = chars[i];
+        out += (c < 128) ? (char)c : '?';
+    }
+    return out;
+}
+
+// Safe dereference with trivial validity check
+static inline void* safe_ptr(void* ptr) {
+    // just check non-null and not obviously bad; no SIGSEGV guard here —
+    // game objects live in managed heap and are valid while PlayerManager is alive
+    return ((uintptr_t)ptr > 0x1000) ? ptr : nullptr;
+}
+
+template<typename T>
+static inline T read_field(void* obj, uintptr_t offset) {
+    return *(T*)((uintptr_t)obj + offset);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Base address
+// ─────────────────────────────────────────────────────────────────────────────
+static uintptr_t g_il2cpp_base = 0;
+
+static uintptr_t find_lib_base(const char* libname) {
+    std::ifstream maps("/proc/self/maps");
     std::string line;
-    while (std::getline(f, line)) {
-        if (line.find("libil2cpp.so") == std::string::npos) continue;
-        if (line.find("r-xp") == std::string::npos) continue;
-        auto pos = line.rfind(' ');
-        if (pos == std::string::npos) continue;
-        std::string path = line.substr(pos + 1);
-        while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
-            path.pop_back();
-        return path;
+    while (std::getline(maps, line)) {
+        if (line.find(libname) == std::string::npos) continue;
+        // want r--p or r-xp mapping at offset 0
+        size_t perm_start = line.find(' ');
+        if (perm_start == std::string::npos) continue;
+        std::string perm = line.substr(perm_start + 1, 4);
+        if (perm[0] != 'r') continue;
+        // offset must be 00000000
+        size_t col2 = line.find(' ', perm_start + 5);
+        if (col2 == std::string::npos) continue;
+        std::string offset_str = line.substr(col2 + 1, 8);
+        if (offset_str != "00000000") continue;
+        uintptr_t start = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
+        if (*(uint32_t*)start == 0x464C457F) return start;
     }
-    return "";
+    return 0;
 }
 
-// Read domain pointer directly from mono_root_domain global var
-// mono_get_root_domain (RVA 0x574ae14, size 4) is:
-//   adrp x0, <page>
-//   ldr x0, [x0, #offset]  (or similar)
-//   ret
-// We disassemble it to find where the global var lives
-static void* read_root_domain_var(void* h) {
-    // Get address of mono_get_root_domain function
-    void* fn_ptr = dlsym(h, "mono_get_root_domain");
-    if (!fn_ptr) { LOGE("mono_get_root_domain not found"); return nullptr; }
-    LOGI("mono_get_root_domain @ %p", fn_ptr);
-    
-    // Read first 8 bytes (2 ARM64 instructions)
-    uint32_t insns[2] = {};
-    memcpy(insns, fn_ptr, 8);
-    LOGI("insn0=0x%08x insn1=0x%08x", insns[0], insns[1]);
-    
-    // Follow B (branch) instruction if present
-    uintptr_t cur = (uintptr_t)fn_ptr;
-    for (int depth = 0; depth < 32; depth++) {
-        uint32_t in0 = 0, in1 = 0;
-        memcpy(&in0, (void*)cur, 4);
-        memcpy(&in1, (void*)(cur+4), 4);
-        LOGI("depth=%d @ 0x%lx insn0=0x%08x insn1=0x%08x", depth, cur, in0, in1);
-
-        // B unconditional: 0x14000000 mask
-        if ((in0 & 0xFC000000) == 0x14000000) {
-            int32_t imm26 = (int32_t)(in0 << 6) >> 6;
-            cur = cur + (int64_t)imm26 * 4;
-            LOGI("B -> 0x%lx", cur);
-            continue;
-        }
-        // BL: 0x94000000 — skip
-        if ((in0 & 0xFC000000) == 0x94000000) {
-            cur += 4; continue;
-        }
-        // LDR Xn, label (0x58000000)
-        if ((in0 & 0xFF000000) == 0x58000000) {
-            int32_t imm19 = (int32_t)(in0 << 8) >> 13;  // bits[23:5], *4
-            uintptr_t var_addr = cur + (int64_t)imm19 * 4;
-            LOGI("LDR literal: var=0x%lx", var_addr);
-            void* domain = nullptr;
-            memcpy(&domain, (void*)var_addr, 8);
-            return domain;
-        }
-        // ADRP (0x90000000)
-        if ((in0 & 0x9F000000) == 0x90000000) {
-            int64_t immhi = (int32_t)(in0 & 0x00FFFFE0) >> 3;
-            int64_t immlo = (in0 >> 29) & 3;
-            uintptr_t page = (cur & ~0xFFFULL) + ((immhi | immlo) << 12);
-            // next: LDR Xm, [Xn, #imm12*8]
-            uint32_t imm12 = (in1 >> 10) & 0xFFF;
-            uintptr_t var_addr = page + (uintptr_t)imm12 * 8;
-            LOGI("ADRP+LDR: page=0x%lx imm12=%d var=0x%lx", page, imm12, var_addr);
-            void* domain = nullptr;
-            memcpy(&domain, (void*)var_addr, 8);
-            return domain;
-        }
-        // RET
-        if (in0 == 0xD65F03C0) { LOGE("RET without finding var"); return nullptr; }
-        // Skip unknown instructions (prologue, STP, MOV etc) — scan forward
-        LOGI("skip insn 0x%08x @ 0x%lx", in0, cur);
-        cur += 4;
-        continue;
-    }
-    LOGE("too many branches");
-    return nullptr;
+static inline void* rva(uintptr_t offset) {
+    return (void*)(g_il2cpp_base + offset);
 }
 
-static void* find_csharp(void* domain) {
-    if (!g_corlib || !g_asm_image || !g_img_name) return nullptr;
+// ─────────────────────────────────────────────────────────────────────────────
+// shadowhook (already loaded by game — we just dlopen with RTLD_NOLOAD)
+// ─────────────────────────────────────────────────────────────────────────────
+using fn_sh_init = int(*)(int mode, void* option);
+using fn_sh_hook = void*(*)(void* func, void* new_func, void** orig);
 
-    void* corlib = g_corlib(domain);
-    LOGI("corlib=%p", corlib);
-    if (!corlib || (uintptr_t)corlib < 0x10000) return nullptr;
+static fn_sh_init  sh_init  = nullptr;
+static fn_sh_hook  sh_hook  = nullptr;
 
-    for (int off = 0x40; off <= 0xC0; off += 8) {
-        uintptr_t list = 0;
-        if ((uintptr_t)domain + off < 0x10000) continue;
-        memcpy(&list, (char*)domain + off, sizeof(list));
-        if (list < 0x10000 || list > 0x7fffffffffff) continue;
+static bool load_shadowhook() {
+    // game already loaded it; RTLD_NOLOAD returns handle without re-loading
+    void* h = dlopen("libshadowhook.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) {
+        // fallback: try full path via /proc/self/maps
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            if (line.find("libshadowhook.so") == std::string::npos) continue;
+            size_t slash = line.rfind('/');
+            if (slash == std::string::npos) continue;
+            std::string path = line.substr(slash);
+            // trim newline/space
+            while (!path.empty() && (path.back() == '\n' || path.back() == ' '))
+                path.pop_back();
+            h = dlopen(path.c_str(), RTLD_LAZY | RTLD_GLOBAL);
+            if (h) break;
+        }
+    }
+    if (!h) { LOGE("shadowhook: dlopen failed: %s", dlerror()); return false; }
 
-        uintptr_t data0 = 0;
-        memcpy(&data0, (void*)list, sizeof(data0));
-        if (data0 < 0x10000) continue;
+    sh_init = (fn_sh_init)dlsym(h, "shadowhook_init");
+    sh_hook = (fn_sh_hook)dlsym(h, "shadowhook_hook_func_addr");
 
-        void* img0 = g_asm_image((void*)data0);
-        if (!img0 || (uintptr_t)img0 < 0x10000) continue;
+    if (!sh_init || !sh_hook) { LOGE("shadowhook: symbols not found"); return false; }
+    // SHADOWHOOK_MODE_UNIQUE = 1
+    int r = sh_init(1, nullptr);
+    LOGI("shadowhook_init returned %d", r);
+    return true;
+}
 
-        uintptr_t node = list;
-        for (int i = 0; i < 256 && node > 0x10000; i++) {
-            uintptr_t data = 0, next = 0;
-            memcpy(&data, (void*)node,     8);
-            memcpy(&next, (char*)node + 8, 8);
-            if (data > 0x10000) {
-                void* img = g_asm_image((void*)data);
-                if (img && (uintptr_t)img > 0x10000) {
-                    const char* name = g_img_name(img);
-                    if (name && (uintptr_t)name > 0x10000) {
-                        LOGI("off=0x%x [%d] %s", off, i, name);
-                        if (strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
-                            return img;
+static bool do_hook(uintptr_t rva_offset, void* hook_fn, void** orig) {
+    void* target = rva(rva_offset);
+    void* stub = sh_hook(target, hook_fn, orig);
+    if (!stub) { LOGE("hook failed at RVA 0x%lx", rva_offset); return false; }
+    LOGI("hooked RVA 0x%lx -> stub %p", rva_offset, stub);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Player registry
+// ─────────────────────────────────────────────────────────────────────────────
+struct PlayerInfo {
+    void*       pm_ptr;
+    Vec3        pos;
+    float       health;
+    float       max_health;
+    std::string display_name;
+    bool        is_local;
+};
+
+static std::mutex           g_players_mutex;
+static std::vector<void*>   g_players;      // raw PlayerManager* pointers
+static void*                g_local_pm = nullptr;
+static std::atomic<bool>    g_injected{false};
+
+static void add_player(void* pm) {
+    std::lock_guard<std::mutex> lk(g_players_mutex);
+    for (auto p : g_players) if (p == pm) return;
+    g_players.push_back(pm);
+    LOGI("player added: %p  total=%zu", pm, g_players.size());
+}
+
+static void remove_player(void* pm) {
+    std::lock_guard<std::mutex> lk(g_players_mutex);
+    auto it = std::find(g_players.begin(), g_players.end(), pm);
+    if (it != g_players.end()) g_players.erase(it);
+    if (g_local_pm == pm) g_local_pm = nullptr;
+}
+
+// read a PlayerInfo snapshot from a live PlayerManager*
+static PlayerInfo snapshot_player(void* pm) {
+    PlayerInfo pi{};
+    pi.pm_ptr = pm;
+    pi.is_local = (pm == g_local_pm);
+
+    // position
+    pi.pos = read_field<Vec3>(pm, OFF_PM_lastTickPosition);
+
+    // health via playerEventHandler (Gum extends GuB which has Health)
+    void* peh = safe_ptr(read_field<void*>(pm, OFF_PM_playerEventHandler));
+    if (peh) {
+        void* health_gun = safe_ptr(read_field<void*>(peh, OFF_GuB_Health));
+        if (health_gun) {
+            pi.health = read_field<float>(health_gun, OFF_GUN_float_value);
+        }
+        // display name
+        void* name_str = safe_ptr(read_field<void*>(peh, OFF_GuB_DisplayName));
+        if (name_str) {
+            pi.display_name = read_il2cpp_string(name_str);
+        }
+    }
+
+    // max health from vitals/GenericVitals chain
+    // PlayerVitals → EntityVitals → GenericVitals (m_MaxHealth @ 0x88 within GenericVitals)
+    // GenericVitals starts at its base class chain. Determined from dump:
+    // NetworkBehaviour(~0x68) + Guy(0x68+0x10=0x78 total for Entity+bounds)
+    // GenericVitals m_MaxHealth @ 0x88 (absolute from obj start)
+    void* vitals = safe_ptr(read_field<void*>(pm, OFF_PM_vitals));
+    if (vitals) {
+        pi.max_health = read_field<float>(vitals, 0x88);
+        if (pi.max_health <= 0.f || pi.max_health > 10000.f) pi.max_health = 100.f;
+    } else {
+        pi.max_health = 100.f;
+    }
+
+    if (pi.display_name.empty()) pi.display_name = "Player";
+    return pi;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Menu state
+// ─────────────────────────────────────────────────────────────────────────────
+struct MenuState {
+    bool visible         = false;
+    int  active_tab      = 0; // 0=Aimbot 1=Visuals 2=Misc 3=Skins
+    bool esp_enabled     = true;
+    bool esp_box         = true;
+    bool esp_health      = true;
+    bool esp_name        = true;
+    bool aimbot_enabled  = false;
+    bool aimbot_silent   = false;
+    bool aimbot_vis_only = true;
+    bool no_recoil       = false;
+    float esp_max_dist   = 500.f;
+};
+static MenuState g_menu;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Camera calls by RVA (safe to call from render thread — it's Unity's own thread)
+// ─────────────────────────────────────────────────────────────────────────────
+using fn_cam_getmain = void*(*)(void* method_info);
+using fn_cam_w2s     = Vec3(*)(void* camera, Vec3 pos, void* method_info);
+using fn_cam_pw      = int(*)(void* camera, void* method_info);
+using fn_cam_ph      = int(*)(void* camera, void* method_info);
+
+static fn_cam_getmain g_cam_getmain = nullptr;
+static fn_cam_w2s     g_cam_w2s     = nullptr;
+static fn_cam_pw      g_cam_pw      = nullptr;
+static fn_cam_ph      g_cam_ph      = nullptr;
+
+static void init_camera_fns() {
+    g_cam_getmain = (fn_cam_getmain)rva(RVA_Cam_GetMain);
+    g_cam_w2s     = (fn_cam_w2s)    rva(RVA_Cam_W2S);
+    g_cam_pw      = (fn_cam_pw)     rva(0xc739174UL);
+    g_cam_ph      = (fn_cam_ph)     rva(0xc739228UL);
+}
+
+// world→screen, returns false if behind camera (z < 0)
+static bool world_to_screen(void* cam, const Vec3& world, Vec2& out) {
+    Vec3 s = g_cam_w2s(cam, world, nullptr);
+    if (s.z < 0.f) return false;
+    out.x = s.x;
+    out.y = s.y;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenGL ES 2.0 renderer
+// ─────────────────────────────────────────────────────────────────────────────
+static GLuint  g_prog  = 0;
+static GLint   g_uloc_res   = -1;
+static GLint   g_uloc_color = -1;
+static GLint   g_aloc_pos   = -1;
+static int     g_scr_w = 1280, g_scr_h = 720;
+static bool    g_gl_ready   = false;
+
+static const char* k_vs =
+    "attribute vec2 aPos;\n"
+    "uniform vec2 uRes;\n"
+    "void main() {\n"
+    "  vec2 p = aPos / uRes * 2.0 - 1.0;\n"
+    "  gl_Position = vec4(p.x, -p.y, 0.0, 1.0);\n"
+    "}\n";
+
+static const char* k_fs =
+    "precision mediump float;\n"
+    "uniform vec4 uColor;\n"
+    "void main() { gl_FragColor = uColor; }\n";
+
+static GLuint compile_shader(GLenum type, const char* src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    return s;
+}
+
+static bool init_gl() {
+    GLuint vs = compile_shader(GL_VERTEX_SHADER,   k_vs);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, k_fs);
+    g_prog = glCreateProgram();
+    glAttachShader(g_prog, vs);
+    glAttachShader(g_prog, fs);
+    glLinkProgram(g_prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    g_uloc_res   = glGetUniformLocation(g_prog, "uRes");
+    g_uloc_color = glGetUniformLocation(g_prog, "uColor");
+    g_aloc_pos   = glGetAttribLocation(g_prog,  "aPos");
+    LOGI("GL program linked, res=%d color=%d pos=%d", g_uloc_res, g_uloc_color, g_aloc_pos);
+    return true;
+}
+
+static void set_color(float r, float g, float b, float a) {
+    glUniform4f(g_uloc_color, r, g, b, a);
+}
+
+static void draw_verts(GLenum mode, const float* verts, int count) {
+    glVertexAttribPointer(g_aloc_pos, 2, GL_FLOAT, GL_FALSE, 0, verts);
+    glEnableVertexAttribArray(g_aloc_pos);
+    glDrawArrays(mode, 0, count);
+}
+
+static void draw_rect_outline(float x, float y, float w, float h,
+                               float r, float g, float b, float a, float thickness = 1.f) {
+    (void)thickness;
+    set_color(r, g, b, a);
+    float v[] = { x,y, x+w,y, x+w,y+h, x,y+h };
+    draw_verts(GL_LINE_LOOP, v, 4);
+}
+
+static void draw_rect_filled(float x, float y, float w, float h,
+                              float r, float g, float b, float a) {
+    set_color(r, g, b, a);
+    float v[] = { x,y, x+w,y, x,y+h, x+w,y+h };
+    draw_verts(GL_TRIANGLE_STRIP, v, 4);
+}
+
+static void draw_line(float x1, float y1, float x2, float y2,
+                       float r, float g, float b, float a) {
+    set_color(r, g, b, a);
+    float v[] = { x1,y1, x2,y2 };
+    draw_verts(GL_LINES, v, 2);
+}
+
+// ─── 5×7 bitmap font (ASCII 32-126) ─────────────────────────────────────────
+// Each char: 5 columns × 7 rows, packed into 5 bytes (7 bits each, LSB=top)
+static const uint8_t k_font[95][5] = {
+  {0x00,0x00,0x00,0x00,0x00}, // 32 ' '
+  {0x00,0x00,0x5f,0x00,0x00}, // 33 '!'
+  {0x00,0x07,0x00,0x07,0x00}, // 34 '"'
+  {0x14,0x7f,0x14,0x7f,0x14}, // 35 '#'
+  {0x24,0x2a,0x7f,0x2a,0x12}, // 36 '$'
+  {0x23,0x13,0x08,0x64,0x62}, // 37 '%'
+  {0x36,0x49,0x55,0x22,0x50}, // 38 '&'
+  {0x00,0x05,0x03,0x00,0x00}, // 39 '\''
+  {0x00,0x1c,0x22,0x41,0x00}, // 40 '('
+  {0x00,0x41,0x22,0x1c,0x00}, // 41 ')'
+  {0x14,0x08,0x3e,0x08,0x14}, // 42 '*'
+  {0x08,0x08,0x3e,0x08,0x08}, // 43 '+'
+  {0x00,0x50,0x30,0x00,0x00}, // 44 ','
+  {0x08,0x08,0x08,0x08,0x08}, // 45 '-'
+  {0x00,0x60,0x60,0x00,0x00}, // 46 '.'
+  {0x20,0x10,0x08,0x04,0x02}, // 47 '/'
+  {0x3e,0x51,0x49,0x45,0x3e}, // 48 '0'
+  {0x00,0x42,0x7f,0x40,0x00}, // 49 '1'
+  {0x42,0x61,0x51,0x49,0x46}, // 50 '2'
+  {0x21,0x41,0x45,0x4b,0x31}, // 51 '3'
+  {0x18,0x14,0x12,0x7f,0x10}, // 52 '4'
+  {0x27,0x45,0x45,0x45,0x39}, // 53 '5'
+  {0x3c,0x4a,0x49,0x49,0x30}, // 54 '6'
+  {0x01,0x71,0x09,0x05,0x03}, // 55 '7'
+  {0x36,0x49,0x49,0x49,0x36}, // 56 '8'
+  {0x06,0x49,0x49,0x29,0x1e}, // 57 '9'
+  {0x00,0x36,0x36,0x00,0x00}, // 58 ':'
+  {0x00,0x56,0x36,0x00,0x00}, // 59 ';'
+  {0x08,0x14,0x22,0x41,0x00}, // 60 '<'
+  {0x14,0x14,0x14,0x14,0x14}, // 61 '='
+  {0x00,0x41,0x22,0x14,0x08}, // 62 '>'
+  {0x02,0x01,0x51,0x09,0x06}, // 63 '?'
+  {0x32,0x49,0x79,0x41,0x3e}, // 64 '@'
+  {0x7e,0x11,0x11,0x11,0x7e}, // 65 'A'
+  {0x7f,0x49,0x49,0x49,0x36}, // 66 'B'
+  {0x3e,0x41,0x41,0x41,0x22}, // 67 'C'
+  {0x7f,0x41,0x41,0x22,0x1c}, // 68 'D'
+  {0x7f,0x49,0x49,0x49,0x41}, // 69 'E'
+  {0x7f,0x09,0x09,0x09,0x01}, // 70 'F'
+  {0x3e,0x41,0x49,0x49,0x7a}, // 71 'G'
+  {0x7f,0x08,0x08,0x08,0x7f}, // 72 'H'
+  {0x00,0x41,0x7f,0x41,0x00}, // 73 'I'
+  {0x20,0x40,0x41,0x3f,0x01}, // 74 'J'
+  {0x7f,0x08,0x14,0x22,0x41}, // 75 'K'
+  {0x7f,0x40,0x40,0x40,0x40}, // 76 'L'
+  {0x7f,0x02,0x0c,0x02,0x7f}, // 77 'M'
+  {0x7f,0x04,0x08,0x10,0x7f}, // 78 'N'
+  {0x3e,0x41,0x41,0x41,0x3e}, // 79 'O'
+  {0x7f,0x09,0x09,0x09,0x06}, // 80 'P'
+  {0x3e,0x41,0x51,0x21,0x5e}, // 81 'Q'
+  {0x7f,0x09,0x19,0x29,0x46}, // 82 'R'
+  {0x46,0x49,0x49,0x49,0x31}, // 83 'S'
+  {0x01,0x01,0x7f,0x01,0x01}, // 84 'T'
+  {0x3f,0x40,0x40,0x40,0x3f}, // 85 'U'
+  {0x1f,0x20,0x40,0x20,0x1f}, // 86 'V'
+  {0x3f,0x40,0x38,0x40,0x3f}, // 87 'W'
+  {0x63,0x14,0x08,0x14,0x63}, // 88 'X'
+  {0x07,0x08,0x70,0x08,0x07}, // 89 'Y'
+  {0x61,0x51,0x49,0x45,0x43}, // 90 'Z'
+  {0x00,0x7f,0x41,0x41,0x00}, // 91 '['
+  {0x02,0x04,0x08,0x10,0x20}, // 92 '\'
+  {0x00,0x41,0x41,0x7f,0x00}, // 93 ']'
+  {0x04,0x02,0x01,0x02,0x04}, // 94 '^'
+  {0x40,0x40,0x40,0x40,0x40}, // 95 '_'
+  {0x00,0x01,0x02,0x04,0x00}, // 96 '`'
+  {0x20,0x54,0x54,0x54,0x78}, // 97 'a'
+  {0x7f,0x48,0x44,0x44,0x38}, // 98 'b'
+  {0x38,0x44,0x44,0x44,0x20}, // 99 'c'
+  {0x38,0x44,0x44,0x48,0x7f}, // 100 'd'
+  {0x38,0x54,0x54,0x54,0x18}, // 101 'e'
+  {0x08,0x7e,0x09,0x01,0x02}, // 102 'f'
+  {0x0c,0x52,0x52,0x52,0x3e}, // 103 'g'
+  {0x7f,0x08,0x04,0x04,0x78}, // 104 'h'
+  {0x00,0x44,0x7d,0x40,0x00}, // 105 'i'
+  {0x20,0x40,0x44,0x3d,0x00}, // 106 'j'
+  {0x7f,0x10,0x28,0x44,0x00}, // 107 'k'
+  {0x00,0x41,0x7f,0x40,0x00}, // 108 'l'
+  {0x7c,0x04,0x18,0x04,0x78}, // 109 'm'
+  {0x7c,0x08,0x04,0x04,0x78}, // 110 'n'
+  {0x38,0x44,0x44,0x44,0x38}, // 111 'o'
+  {0x7c,0x14,0x14,0x14,0x08}, // 112 'p'
+  {0x08,0x14,0x14,0x18,0x7c}, // 113 'q'
+  {0x7c,0x08,0x04,0x04,0x08}, // 114 'r'
+  {0x48,0x54,0x54,0x54,0x20}, // 115 's'
+  {0x04,0x3f,0x44,0x40,0x20}, // 116 't'
+  {0x3c,0x40,0x40,0x20,0x7c}, // 117 'u'
+  {0x1c,0x20,0x40,0x20,0x1c}, // 118 'v'
+  {0x3c,0x40,0x30,0x40,0x3c}, // 119 'w'
+  {0x44,0x28,0x10,0x28,0x44}, // 120 'x'
+  {0x0c,0x50,0x50,0x50,0x3c}, // 121 'y'
+  {0x44,0x64,0x54,0x4c,0x44}, // 122 'z'
+  {0x00,0x08,0x36,0x41,0x00}, // 123 '{'
+  {0x00,0x00,0x7f,0x00,0x00}, // 124 '|'
+  {0x00,0x41,0x36,0x08,0x00}, // 125 '}'
+  {0x10,0x08,0x08,0x10,0x08}, // 126 '~'
+};
+
+// draw a single char at pixel position, scale=pixel size per font-pixel
+static void draw_char(char c, float px, float py, float scale,
+                       float r, float g, float b, float a) {
+    if (c < 32 || c > 126) return;
+    const uint8_t* glyph = k_font[(int)c - 32];
+    set_color(r, g, b, a);
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = glyph[col];
+        for (int row = 0; row < 7; row++) {
+            if (bits & (1 << row)) {
+                float x = px + col * scale;
+                float y = py + row * scale;
+                float v[] = { x, y, x+scale, y, x, y+scale, x+scale, y+scale };
+                draw_verts(GL_TRIANGLE_STRIP, v, 4);
+            }
+        }
+    }
+}
+
+static void draw_text(const char* text, float px, float py, float scale,
+                       float r, float g, float b, float a) {
+    float cx = px;
+    for (int i = 0; text[i]; i++) {
+        draw_char(text[i], cx, py, scale, r, g, b, a);
+        cx += 6.f * scale;
+    }
+}
+
+static float text_width(const char* text, float scale) {
+    int n = 0;
+    for (const char* p = text; *p; p++) n++;
+    return n * 6.f * scale;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ESP rendering
+// ─────────────────────────────────────────────────────────────────────────────
+static void render_esp() {
+    if (!g_menu.esp_enabled) return;
+
+    void* cam = g_cam_getmain(nullptr);
+    if (!cam) return;
+
+    std::vector<void*> players_copy;
+    void* local_copy;
+    {
+        std::lock_guard<std::mutex> lk(g_players_mutex);
+        players_copy = g_players;
+        local_copy   = g_local_pm;
+    }
+
+    Vec3 local_pos{};
+    if (local_copy && safe_ptr(local_copy))
+        local_pos = read_field<Vec3>(local_copy, OFF_PM_lastTickPosition);
+
+    float W = (float)g_scr_w;
+    float H = (float)g_scr_h;
+
+    for (void* pm : players_copy) {
+        if (!pm || !safe_ptr(pm)) continue;
+        if (pm == local_copy) continue;
+
+        PlayerInfo pi = snapshot_player(pm);
+
+        // distance filter
+        float dx = pi.pos.x - local_pos.x;
+        float dy = pi.pos.y - local_pos.y;
+        float dz = pi.pos.z - local_pos.z;
+        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (dist > g_menu.esp_max_dist) continue;
+
+        // project head + feet
+        Vec3 feet_w = pi.pos;
+        Vec3 head_w = { pi.pos.x, pi.pos.y + 1.8f, pi.pos.z };
+
+        Vec2 feet_s, head_s;
+        if (!world_to_screen(cam, feet_w, feet_s)) continue;
+        if (!world_to_screen(cam, head_w, head_s)) continue;
+
+        // flip Y (screen Y is inverted vs world)
+        feet_s.y = H - feet_s.y;
+        head_s.y = H - head_s.y;
+
+        float box_h = feet_s.y - head_s.y;
+        if (box_h < 4.f) continue;
+        float box_w = box_h * 0.4f;
+        float bx = head_s.x - box_w * 0.5f;
+        float by = head_s.y;
+
+        // ESP box (red outline + dark fill)
+        if (g_menu.esp_box) {
+            draw_rect_filled(bx, by, box_w, box_h, 0.f, 0.f, 0.f, 0.35f);
+            draw_rect_outline(bx, by, box_w, box_h, 0.9f, 0.15f, 0.15f, 1.f);
+            // corner highlights (Zenin style)
+            float cl = box_w * 0.25f;
+            float cr = box_h * 0.1f;
+            // top-left
+            draw_line(bx, by, bx+cl, by, 1.f,1.f,1.f,0.9f);
+            draw_line(bx, by, bx, by+cr, 1.f,1.f,1.f,0.9f);
+            // top-right
+            draw_line(bx+box_w, by, bx+box_w-cl, by, 1.f,1.f,1.f,0.9f);
+            draw_line(bx+box_w, by, bx+box_w, by+cr, 1.f,1.f,1.f,0.9f);
+            // bottom-left
+            draw_line(bx, by+box_h, bx+cl, by+box_h, 1.f,1.f,1.f,0.9f);
+            draw_line(bx, by+box_h, bx, by+box_h-cr, 1.f,1.f,1.f,0.9f);
+            // bottom-right
+            draw_line(bx+box_w, by+box_h, bx+box_w-cl, by+box_h, 1.f,1.f,1.f,0.9f);
+            draw_line(bx+box_w, by+box_h, bx+box_w, by+box_h-cr, 1.f,1.f,1.f,0.9f);
+        }
+
+        // health bar (left of box)
+        if (g_menu.esp_health && pi.max_health > 0.f) {
+            float frac = std::max(0.f, std::min(1.f, pi.health / pi.max_health));
+            float bar_x = bx - 5.f;
+            float bar_h = box_h * frac;
+            draw_rect_filled(bar_x, by, 3.f, box_h, 0.f, 0.f, 0.f, 0.6f);
+            // color: green→yellow→red based on health
+            float gr = 1.f - frac, gg = frac, gb = 0.f;
+            draw_rect_filled(bar_x, by + (box_h - bar_h), 3.f, bar_h, gr, gg, gb, 0.9f);
+        }
+
+        // name + hp text
+        if (g_menu.esp_name) {
+            char buf[80];
+            snprintf(buf, sizeof(buf), "%s [%.0f]", pi.display_name.c_str(), pi.health);
+            float scale = 1.5f;
+            float tw = text_width(buf, scale);
+            float tx = head_s.x - tw * 0.5f;
+            float ty = by - 12.f;
+            // shadow
+            draw_text(buf, tx+1, ty+1, scale, 0.f, 0.f, 0.f, 0.9f);
+            draw_text(buf, tx,   ty,   scale, 1.f, 1.f, 1.f, 1.f);
+        }
+
+        // distance
+        {
+            char dbuf[16];
+            snprintf(dbuf, sizeof(dbuf), "%.0fm", dist);
+            float scale = 1.3f;
+            float tw = text_width(dbuf, scale);
+            draw_text(dbuf, feet_s.x - tw*0.5f, feet_s.y + 2.f, scale,
+                      0.9f, 0.9f, 0.9f, 0.85f);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Menu rendering  (BobaDLC External dark+red style)
+// Colors: bg=#141414, panel=#1c1c1c, accent=#e53935, text=#ffffff, sub=#9e9e9e
+// ─────────────────────────────────────────────────────────────────────────────
+static void render_toggle(float x, float y, float w, float h, bool on,
+                           const char* label) {
+    // track bg
+    draw_rect_filled(x, y, w, h, 0.13f,0.13f,0.13f, 1.f);
+    draw_rect_outline(x, y, w, h, 0.25f,0.25f,0.25f, 1.f);
+    // knob
+    float kw = h * 0.9f;
+    float kx = on ? (x + w - kw - 1.f) : (x + 1.f);
+    float ky = y + (h - kw) * 0.5f;
+    if (on) {
+        draw_rect_filled(x, y, w, h, 0.9f,0.08f,0.08f, 1.f);
+    }
+    draw_rect_filled(kx, ky, kw, kw, 1.f,1.f,1.f, 1.f);
+    // label
+    draw_text(label, x - text_width(label, 1.5f) - 4.f, y + (h - 7*1.5f)*0.5f,
+              1.5f, 1.f,1.f,1.f, 1.f);
+}
+
+static void render_menu() {
+    if (!g_menu.visible) return;
+
+    float W = (float)g_scr_w;
+    float H = (float)g_scr_h;
+
+    // center the menu
+    float mw = 480.f, mh = 380.f;
+    float mx = (W - mw) * 0.5f, my = (H - mh) * 0.5f;
+
+    // ── main background ───────────────────────────────────────────────────────
+    draw_rect_filled(mx, my, mw, mh, 0.078f, 0.078f, 0.078f, 0.97f);
+    draw_rect_outline(mx, my, mw, mh, 0.15f, 0.15f, 0.15f, 1.f);
+
+    // ── title bar ─────────────────────────────────────────────────────────────
+    float th = 36.f;
+    draw_rect_filled(mx, my, mw, th, 0.11f, 0.11f, 0.11f, 1.f);
+    // 'Z' logo box (red)
+    draw_rect_filled(mx + 8.f, my + 6.f, 24.f, 24.f, 0.9f, 0.08f, 0.08f, 1.f);
+    draw_text("B", mx + 12.f, my + 11.f, 2.5f, 1.f, 1.f, 1.f, 1.f);
+    draw_text("BobaDLC External", mx + 40.f, my + 11.f, 2.2f, 1.f, 1.f, 1.f, 1.f);
+    // watermark text right side
+    draw_text("bobadlc", mx + mw - text_width("bobadlc", 1.5f) - 8.f, my + 12.f,
+              1.5f, 0.6f, 0.6f, 0.6f, 1.f);
+
+    // ── tab bar ───────────────────────────────────────────────────────────────
+    float tby = my + mh - 36.f;
+    draw_rect_filled(mx, tby, mw, 36.f, 0.1f, 0.1f, 0.1f, 1.f);
+    draw_line(mx, tby, mx+mw, tby, 0.18f, 0.18f, 0.18f, 1.f);
+
+    const char* tabs[] = { "Aimbot", "Visuals", "Misc", "Skins" };
+    float tab_w = mw / 4.f;
+    for (int i = 0; i < 4; i++) {
+        float tx = mx + i * tab_w;
+        bool active = (g_menu.active_tab == i);
+        if (active) {
+            draw_rect_filled(tx, tby, tab_w, 36.f, 0.14f, 0.14f, 0.14f, 1.f);
+            draw_rect_filled(tx, tby, tab_w, 2.f, 0.9f, 0.08f, 0.08f, 1.f);
+        }
+        float label_x = tx + (tab_w - text_width(tabs[i], 1.5f)) * 0.5f;
+        float cr = active ? 1.f : 0.55f;
+        float cg = active ? 1.f : 0.55f;
+        float cb = active ? 1.f : 0.55f;
+        draw_text(tabs[i], label_x, tby + 12.f, 1.5f, cr, cg, cb, 1.f);
+    }
+
+    // ── content area ─────────────────────────────────────────────────────────
+    float cy = my + th + 12.f;
+    float cx = mx + 12.f;
+    float pw = (mw - 36.f) * 0.5f;  // two-column layout
+
+    if (g_menu.active_tab == 0) {
+        // ── AIMBOT ────────────────────────────────────────────────────────────
+        draw_text("Enable",    cx + pw - text_width("Enable", 1.5f) - 36.f, cy,     1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.aimbot_enabled, "");
+        cy += 24.f;
+        draw_text("Silent",    cx + pw - text_width("Silent", 1.5f) - 36.f, cy,     1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.aimbot_silent, "");
+        cy += 28.f;
+
+        // divider
+        draw_line(cx, cy, cx + (mw - 24.f), cy, 0.2f,0.2f,0.2f, 1.f);
+        cy += 10.f;
+        draw_text("Target", cx, cy, 1.5f, 0.5f,0.5f,0.5f, 1.f);
+        cy += 20.f;
+        draw_text("Bones Group",  cx, cy, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        draw_text("Head",  cx + pw - text_width("Head",1.5f), cy, 1.5f, 0.9f,0.08f,0.08f, 1.f);
+        cy += 20.f;
+        draw_text("Visible Check", cx, cy, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.aimbot_vis_only, "");
+
+    } else if (g_menu.active_tab == 1) {
+        // ── VISUALS ───────────────────────────────────────────────────────────
+        draw_text("Enable", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_enabled, "");
+        cy += 24.f;
+
+        draw_text("Bounding Box", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_box, "");
+        cy += 24.f;
+
+        draw_text("Health Bar", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_health, "");
+        cy += 24.f;
+
+        draw_text("Name + HP",  cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_name, "");
+        cy += 28.f;
+
+        draw_line(cx, cy, cx + (mw - 24.f), cy, 0.2f,0.2f,0.2f, 1.f);
+        cy += 10.f;
+
+        // ESP preview label (right column)
+        draw_text("ESP Preview", cx + pw + 12.f, my + th + 12.f, 1.5f, 0.5f,0.5f,0.5f, 1.f);
+        // small player silhouette
+        float px2 = cx + pw + 60.f, py2 = my + th + 32.f;
+        draw_rect_outline(px2, py2, 50.f, 120.f, 0.9f,0.08f,0.08f, 1.f);
+        draw_rect_filled(px2 - 5.f, py2, 3.f, 120.f*0.7f, 0.9f, 0.4f, 0.1f, 0.8f);
+
+    } else if (g_menu.active_tab == 2) {
+        // ── MISC ──────────────────────────────────────────────────────────────
+        draw_text("No Recoil", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.no_recoil, "");
+        cy += 24.f;
+
+        draw_text("Max ESP Dist", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
+        char dbuf[16]; snprintf(dbuf, sizeof(dbuf), "%.0fm", g_menu.esp_max_dist);
+        draw_text(dbuf, cx + pw - text_width(dbuf, 1.5f), cy + 3.f, 1.5f, 0.9f,0.08f,0.08f, 1.f);
+        cy += 24.f;
+
+    } else if (g_menu.active_tab == 3) {
+        // ── SKINS ─────────────────────────────────────────────────────────────
+        draw_text("Coming soon", cx + (pw - text_width("Coming soon",2.f))*0.5f,
+                  my + mh*0.5f - 10.f, 2.f, 0.5f,0.5f,0.5f, 1.f);
+    }
+
+    // ── watermark overlay (top-left corner) ───────────────────────────────────
+    // Handled separately below (always visible)
+}
+
+// ─── permanent watermark (top bar, always on screen) ─────────────────────────
+static void render_watermark() {
+    float bw = 180.f, bh = 22.f, bx = 8.f, by = 8.f;
+    draw_rect_filled(bx, by, bw, bh, 0.08f, 0.08f, 0.08f, 0.85f);
+    draw_rect_outline(bx, by, bw, bh, 0.18f, 0.18f, 0.18f, 1.f);
+    // red 'Z'
+    draw_rect_filled(bx + 3.f, by + 3.f, 16.f, 16.f, 0.9f, 0.08f, 0.08f, 1.f);
+    draw_text("B", bx + 5.5f, by + 5.f, 2.f, 1.f, 1.f, 1.f, 1.f);
+    draw_text("BobaDLC External", bx + 22.f, by + 6.f, 1.5f, 0.9f, 0.9f, 0.9f, 1.f);
+    // version
+    draw_text("1.0", bx + bw - text_width("1.0", 1.2f) - 5.f, by + 7.f, 1.2f, 0.5f,0.5f,0.5f, 1.f);
+
+    // menu toggle hint
+    // подсказка — тапни по ватермарке чтобы открыть меню
+    draw_text("[tap to open]", bx + bw + 5.f, by + 6.f, 1.2f,
+              g_menu.visible ? 0.9f : 0.45f,
+              g_menu.visible ? 0.1f : 0.45f,
+              g_menu.visible ? 0.1f : 0.45f, 0.9f);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Touch input reader — читаем /dev/input/eventX напрямую в отдельном треде.
+// Тап по ватермарке (левый верхний угол, 8..188 x 8..30 в экранных пикселях)
+// переключает меню. Работает независимо от Unity input system.
+// ─────────────────────────────────────────────────────────────────────────────
+#include <linux/input.h>
+#include <dirent.h>
+#include <fcntl.h>
+
+// Зона ватермарки в нормализованных координатах (0..1).
+// Физически: bx=8 bw=180 by=8 bh=22 на любом разрешении.
+// Берём с запасом чтобы было удобно тапать пальцем.
+static constexpr float kWM_X0 = 0.f,   kWM_X1 = 0.22f;
+static constexpr float kWM_Y0 = 0.f,   kWM_Y1 = 0.06f;
+
+// Последняя позиция касания (в ABS единицах устройства, конвертируем позже)
+struct TouchSlot {
+    int x = 0, y = 0;
+    bool down = false;
+};
+
+static std::atomic<bool> g_touch_menu_toggle{false}; // сигнал из тред → рендер
+
+// Найти все /dev/input/eventX которые репортят ABS_MT_POSITION
+static std::vector<std::string> find_touch_devices() {
+    std::vector<std::string> result;
+    DIR* d = opendir("/dev/input");
+    if (!d) return result;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, "event", 5) != 0) continue;
+        std::string path = std::string("/dev/input/") + e->d_name;
+        int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        // проверяем что устройство поддерживает EV_ABS + ABS_MT_POSITION_X
+        uint8_t evbits[EV_MAX / 8 + 1] = {};
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) >= 0) {
+            if (evbits[EV_ABS / 8] & (1 << (EV_ABS % 8))) {
+                uint8_t absbits[ABS_MAX / 8 + 1] = {};
+                if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0) {
+                    if (absbits[ABS_MT_POSITION_X / 8] & (1 << (ABS_MT_POSITION_X % 8))) {
+                        result.push_back(path);
+                        LOGI("touch device: %s", path.c_str());
                     }
                 }
             }
-            node = next;
+        }
+        close(fd);
+    }
+    closedir(d);
+    return result;
+}
+
+static void touch_reader_thread() {
+    // ждём пока игра поднимется
+    sleep(6);
+
+    auto devices = find_touch_devices();
+    if (devices.empty()) { LOGE("no touch devices found"); return; }
+
+    // берём первое найденное тач-устройство
+    const std::string& dev = devices[0];
+    int fd = open(dev.c_str(), O_RDONLY);
+    if (fd < 0) { LOGE("can't open %s", dev.c_str()); return; }
+
+    // получить диапазоны ABS_MT_POSITION_X/Y чтобы нормализовать
+    struct input_absinfo abs_x{}, abs_y{};
+    ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_x);
+    ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_y);
+    float max_x = (abs_x.maximum > 0) ? (float)abs_x.maximum : 1080.f;
+    float max_y = (abs_y.maximum > 0) ? (float)abs_y.maximum : 1920.f;
+    LOGI("touch range: x=0..%.0f y=0..%.0f", max_x, max_y);
+
+    TouchSlot slot{};
+    bool was_down = false;
+    float touch_norm_x = 0.f, touch_norm_y = 0.f;
+
+    struct input_event ev{};
+    while (true) {
+        ssize_t n = read(fd, &ev, sizeof(ev));
+        if (n < (ssize_t)sizeof(ev)) { usleep(5000); continue; }
+
+        if (ev.type == EV_ABS) {
+            if (ev.code == ABS_MT_POSITION_X || ev.code == ABS_X)
+                slot.x = ev.value;
+            else if (ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y)
+                slot.y = ev.value;
+            else if (ev.code == ABS_MT_TRACKING_ID)
+                slot.down = (ev.value != -1);
+        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+            slot.down = (ev.value == 1);
+        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+            // палец поднялся — проверяем был ли тап по ватермарке
+            if (was_down && !slot.down) {
+                float nx = (float)slot.x / max_x;
+                float ny = (float)slot.y / max_y;
+                if (nx >= kWM_X0 && nx <= kWM_X1 &&
+                    ny >= kWM_Y0 && ny <= kWM_Y1) {
+                    g_touch_menu_toggle.store(true);
+                    LOGI("watermark tapped! nx=%.3f ny=%.3f", nx, ny);
+                }
+            }
+            was_down = slot.down;
         }
     }
-    return nullptr;
+    close(fd);
 }
 
-static void cheat_main() {
-    prctl(PR_SET_NAME, "UnityGfxDevice");
-    sleep(25);
-    LOGI("Starting");
-
-    std::string path = find_il2cpp_path();
-    if (path.empty()) { LOGE("path not found"); return; }
-    LOGI("path: %s", path.c_str());
-
-    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
-    if (!h) { LOGE("dlopen: %s", dlerror()); return; }
-
-    g_thread_attach = (fn_ta)dlsym(h, "mono_thread_attach");
-    g_corlib        = (fn_vp)dlsym(h, "mono_domain_get_corlib");
-    g_asm_image     = (fn_vp)dlsym(h, "mono_image_get_assembly");
-    g_img_name      = (fn_nm)dlsym(h, "mono_image_get_name");
-
-    LOGI("attach=%p corlib=%p asm=%p name=%p",
-         (void*)g_thread_attach, (void*)g_corlib,
-         (void*)g_asm_image, (void*)g_img_name);
-
-    // Find var addr once, then poll it
-    uintptr_t domain_var_addr = 0;
-    {
-        // temp call to get the var address
-        // we modify read_root_domain_var to also store the addr
+// check_menu_toggle вызывается из рендер-треда (eglSwapBuffers)
+static void check_menu_toggle() {
+    if (g_touch_menu_toggle.exchange(false)) {
+        g_menu.visible = !g_menu.visible;
+        LOGI("menu toggled -> %s", g_menu.visible ? "open" : "closed");
     }
-    
-    // Use mono_domain_get RVA directly - this worked before (returned 0x7990cbafc0)
-    // RVA 0x574ae18 verified from readelf
-    // Calculate actual address: attach addr - attach_rva + domain_rva  
-    uintptr_t attach_addr = (uintptr_t)g_thread_attach;
-    uintptr_t domain_get_addr = attach_addr - 0x574b280UL + 0x574ae18UL;
-    LOGI("domain_get_addr=0x%lx", domain_get_addr);
-    
-    // Call mono_domain_get directly and log result
-    // Previously returned 0x7990cbafc0 successfully
-    using fn_dg = void*(*)();
-    void* domain = ((fn_dg)domain_get_addr)();
-    LOGI("domain=%p", domain);
-    
-    if (!domain || (uintptr_t)domain < 0x10000) {
-        // Try reading var at offset from ADRP+LDR
-        // target = domain_get_addr + B_offset
-        uint32_t b_insn = 0;
-        memcpy(&b_insn, (void*)domain_get_addr, 4);
-        int32_t imm26 = (int32_t)(b_insn << 6) >> 6;
-        uintptr_t target = domain_get_addr + (int64_t)imm26 * 4;
-        // ADRP at target+8
-        uint32_t adrp = 0, ldr = 0;
-        memcpy(&adrp, (void*)(target+8), 4);
-        memcpy(&ldr,  (void*)(target+12), 4);
-        int64_t immhi = (int32_t)(adrp & 0x00FFFFE0) >> 3;
-        int64_t immlo = (adrp >> 29) & 3;
-        uintptr_t page = ((target+8) & ~0xFFFULL) + ((immhi|immlo) << 12);
-        uint32_t imm12 = (ldr >> 10) & 0xFFF;
-        uintptr_t var = page + (uintptr_t)imm12 * 8;
-        LOGI("var=0x%lx", var);
-        memcpy(&domain, (void*)var, 8);
-        LOGI("domain_from_var=%p", domain);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// eglSwapBuffers hook
+// ─────────────────────────────────────────────────────────────────────────────
+using fn_eglSwap = EGLBoolean(*)(EGLDisplay, EGLSurface);
+static fn_eglSwap g_orig_swap = nullptr;
+
+static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
+    if (!g_injected.load()) return g_orig_swap(dpy, surf);
+
+    // init GL program once
+    if (!g_gl_ready) {
+        if (init_gl()) g_gl_ready = true;
+        // read screen size from camera or EGL
+        if (g_cam_pw && g_cam_getmain) {
+            void* cam = g_cam_getmain(nullptr);
+            if (cam) {
+                g_scr_w = g_cam_pw(cam, nullptr);
+                g_scr_h = g_cam_ph(cam, nullptr);
+                if (g_scr_w <= 0) g_scr_w = 1280;
+                if (g_scr_h <= 0) g_scr_h = 720;
+                LOGI("screen: %dx%d", g_scr_w, g_scr_h);
+            }
+        }
     }
-    
-    if (domain && (uintptr_t)domain > 0x10000) {
-        LOGI("GOT DOMAIN: %p", domain);
-        // attach and find image
-        if (g_thread_attach) g_thread_attach(domain);
-        LOGI("attached");
-        void* img = find_csharp(domain);
-        if (img) LOGI("SUCCESS Assembly-CSharp: %p", img);
-        else LOGE("Assembly-CSharp not found");
+
+    if (g_gl_ready && g_prog) {
+        glUseProgram(g_prog);
+        glUniform2f(g_uloc_res, (float)g_scr_w, (float)g_scr_h);
+
+        // save & set GL state
+        GLboolean old_blend, old_depth;
+        glGetBooleanv(GL_BLEND,       &old_blend);
+        glGetBooleanv(GL_DEPTH_TEST,  &old_depth);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_DEPTH_TEST);
+
+        // render
+        render_watermark();
+        check_menu_toggle();
+        render_menu();
+        render_esp();
+
+        // restore GL state
+        if (!old_blend) glDisable(GL_BLEND);
+        if (old_depth)  glEnable(GL_DEPTH_TEST);
+        glUseProgram(0);
+        glDisableVertexAttribArray(g_aloc_pos);
+    }
+
+    return g_orig_swap(dpy, surf);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PlayerManager hooks
+// ─────────────────────────────────────────────────────────────────────────────
+using fn_pm_void = void(*)(void* __this, void* method);
+
+static fn_pm_void g_orig_awake     = nullptr;
+static fn_pm_void g_orig_on_enable = nullptr;
+static fn_pm_void g_orig_on_disable = nullptr;
+
+static void hooked_Awake(void* __this, void* method) {
+    // Call original first — lets Unity initialize the component
+    if (g_orig_awake) g_orig_awake(__this, method);
+
+    LOGI("Awake HIT! this=%p", __this);
+
+    // Mark first-ever awake as local player (heuristic: the one that calls Awake on game start)
+    // OnStartLocalPlayer (RVA 0x6673f78) is the definitive signal but Awake fires earlier.
+    // We'll refine local vs remote in OnEnable.
+    static bool first = true;
+    if (first) {
+        g_local_pm = __this;
+        first = false;
+        g_injected.store(true);
+        init_camera_fns();
+        LOGI("local player set to %p", __this);
+    }
+    add_player(__this);
+}
+
+static void hooked_OnEnable(void* __this, void* method) {
+    if (g_orig_on_enable) g_orig_on_enable(__this, method);
+    add_player(__this);
+}
+
+static void hooked_OnDisable(void* __this, void* method) {
+    if (g_orig_on_disable) g_orig_on_disable(__this, method);
+    remove_player(__this);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hook installation
+// ─────────────────────────────────────────────────────────────────────────────
+static void install_hooks() {
+    if (!load_shadowhook()) { LOGE("shadowhook load failed"); return; }
+
+    // PlayerManager hooks
+    do_hook(RVA_PM_Awake,     (void*)hooked_Awake,      (void**)&g_orig_awake);
+    do_hook(RVA_PM_OnEnable,  (void*)hooked_OnEnable,   (void**)&g_orig_on_enable);
+    do_hook(RVA_PM_OnDisable, (void*)hooked_OnDisable,  (void**)&g_orig_on_disable);
+
+    // eglSwapBuffers hook — the render thread is Unity's own, safe for IL2CPP calls
+    void* egl_lib = dlopen("libEGL.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!egl_lib) egl_lib = dlopen("libEGL.so", RTLD_LAZY);
+    if (egl_lib) {
+        void* swap_fn = dlsym(egl_lib, "eglSwapBuffers");
+        if (swap_fn) {
+            void* stub = sh_hook(swap_fn, (void*)hooked_eglSwapBuffers, (void**)&g_orig_swap);
+            LOGI("eglSwapBuffers hook: stub=%p", stub);
+        } else {
+            LOGE("eglSwapBuffers not found in libEGL.so");
+        }
     } else {
-        LOGE("no domain");
-    }
-    
-    int tick = 0;
-    while (true) {
-        sleep(5);
-        if (++tick % 6 == 0) LOGI("tick=%d", tick);
+        LOGE("libEGL.so dlopen failed");
     }
 
-    if (g_thread_attach) g_thread_attach(domain);
-    LOGI("attached");
+    LOGI("all hooks installed");
 
-    void* img = find_csharp(domain);
-    if (!img) { LOGE("Assembly-CSharp not found"); return; }
-    LOGI("SUCCESS img=%p", img);
-
-    
-    while (true) {
-        sleep(2);
-        if (++tick % 10 == 0) LOGI("tick=%d", tick);
-    }
+    // запускаем тред чтения тачскрина
+    std::thread(touch_reader_thread).detach();
 }
 
-class OxideModule : public zygisk::ModuleBase {
+// ─────────────────────────────────────────────────────────────────────────────
+// Zygisk module
+// ─────────────────────────────────────────────────────────────────────────────
+class LotusorModule : public zygisk::ModuleBase {
     zygisk::Api* api_ = nullptr;
     JNIEnv*      env_ = nullptr;
-    bool         ok_  = false;
+    bool         target_ = false;
 public:
-    void onLoad(zygisk::Api* a, JNIEnv* e) override { api_=a; env_=e; }
-    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
-        if (!args->nice_name) { api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY); return; }
-        const char* p = env_->GetStringUTFChars(args->nice_name, nullptr);
-        if (p) { if (strstr(p,"catsbit")||strstr(p,"oxidesurvival")) ok_=true; env_->ReleaseStringUTFChars(args->nice_name,p); }
-        if (!ok_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+    void onLoad(zygisk::Api* api, JNIEnv* env) override {
+        api_ = api; env_ = env;
     }
+
+    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
+        if (!args || !args->nice_name) {
+            api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+        const char* pkg = env_->GetStringUTFChars(args->nice_name, nullptr);
+        if (pkg) {
+            // Oxide Survival by Catsbit
+            if (strstr(pkg, "com.catsbit.oxidesurvivalisland") || strstr(pkg, "catsbit"))
+                target_ = true;
+            env_->ReleaseStringUTFChars(args->nice_name, pkg);
+        }
+        if (!target_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+    }
+
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
-        if (!ok_) return;
-        LOGI("Injected");
-        std::thread(cheat_main).detach();
+        if (!target_) return;
+
+        // Find libil2cpp base — it may not be loaded yet at this point.
+        // Spin in a detached thread until it appears.
+        std::thread([]() {
+            LOGI("waiting for libil2cpp.so...");
+            for (int i = 0; i < 600; i++) {
+                uintptr_t base = find_lib_base("libil2cpp.so");
+                if (base) {
+                    g_il2cpp_base = base;
+                    LOGI("libil2cpp.so base: 0x%lx", base);
+                    // small extra delay so the lib fully initializes before we hook
+                    sleep(2);
+                    install_hooks();
+                    return;
+                }
+                usleep(200000); // 200ms
+            }
+            LOGE("libil2cpp.so never appeared");
+        }).detach();
     }
 };
 
-REGISTER_ZYGISK_MODULE(OxideModule)
+REGISTER_ZYGISK_MODULE(LotusorModule)
+
 extern "C" __attribute__((visibility("default"))) int zygisk_module_abi_version() { return 4; }
