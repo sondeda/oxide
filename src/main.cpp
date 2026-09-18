@@ -1,5 +1,6 @@
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/prctl.h>
 #include <jni.h>
 #include <android/log.h>
 #include <unistd.h>
@@ -8,182 +9,150 @@
 #include <thread>
 #include <fstream>
 #include <cstring>
-#include <signal.h>
-#include <setjmp.h>
 #include "zygisk.hpp"
 
 #define TAG "OxideCheat"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ── RVAs from readelf ─────────────────────────────────────────────────────────
-#define RVA_domain_get      0x574ae18UL
-#define RVA_root_domain     0x574ae14UL
-#define RVA_thread_attach   0x574b280UL
-#define RVA_corlib          0x574ae44UL
-#define RVA_assembly_image  0x574ae0cUL
-#define RVA_image_name      0x574ae10UL
-#define RVA_class_checked   0x574b440UL
-#define RVA_class_name      0x574b098UL
-#define RVA_class_namespace 0x574b094UL
-#define RVA_num_fields      0x574b030UL
-#define RVA_field_name      0x574b230UL
-#define RVA_field_offset    0x574b23cUL
-#define RVA_field_set       0x574b234UL
+// ── RVAs verified from readelf ─────────────────────────────────────────────────
+// readelf -s libil2cpp.so | grep GLOBAL
+#define RVA_domain_get     0x574ae18UL  // mono_domain_get
+#define RVA_root_domain    0x574ae14UL  // mono_get_root_domain  
+#define RVA_thread_attach  0x574b280UL  // mono_thread_attach
+#define RVA_corlib         0x574ae44UL  // mono_domain_get_corlib(domain)
+#define RVA_assembly_img   0x574ae0cUL  // mono_image_get_assembly
+#define RVA_image_name     0x574ae10UL  // mono_image_get_name
 
-using fn_vv   = void*(*)();
-using fn_vp   = void*(*)(void*);
-using fn_name = const char*(*)(void*);
-using fn_cc   = void*(*)(void*, uint32_t, int*);
-using fn_nf   = int(*)(void*);
-using fn_fn   = const char*(*)(void*);
-using fn_fo   = int(*)(void*);
-using fn_fs   = void(*)(void*,void*,void*);
-using fn_ta   = void*(*)(void*);
+using fn_vv = void*(*)();
+using fn_vp = void*(*)(void*);
+using fn_nm = const char*(*)(void*);
+using fn_ta = void*(*)(void*);
 
-static uintptr_t g_base = 0;
-#define FN(type, rva) ((type)(g_base + (rva)))
+static uintptr_t g_bias = 0;
+#define FN(type, rva) ((type)(g_bias + (rva)))
 
-// ── safe memory read via process_vm_readv ─────────────────────────────────────
+// ── safe read via process_vm_readv (never crashes on bad ptr) ─────────────────
 template<typename T>
-static bool safe_read(uintptr_t addr, T& out) {
+static bool sr(uintptr_t addr, T& out) {
     if (addr < 0x10000 || addr > 0x7fffffffffff) return false;
-    struct iovec local  = { &out,    sizeof(T) };
-    struct iovec remote = { (void*)addr, sizeof(T) };
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(T);
+    struct iovec l = { &out, sizeof(T) };
+    struct iovec r = { (void*)addr, sizeof(T) };
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(T);
 }
 
-// ── find load_bias for lib ────────────────────────────────────────────────────
-// load_bias = map_start - file_offset for the r-xp (executable) segment
-// RVA + load_bias = actual function address
-static uintptr_t find_load_bias(const char* name) {
-    std::ifstream maps("/proc/self/maps");
+static bool vp(uintptr_t v) { return v > 0x10000 && v < 0x7fffffffffff; }
+
+// ── find load_bias (r-xp segment start - file offset) ────────────────────────
+static uintptr_t find_bias(const char* lib) {
+    std::ifstream f("/proc/self/maps");
     std::string line;
-    while (std::getline(maps, line)) {
-        if (line.find(name) == std::string::npos) continue;
+    while (std::getline(f, line)) {
+        if (line.find(lib) == std::string::npos) continue;
         if (line.find("r-xp") == std::string::npos) continue;
-        // parse: start-end perms offset dev inode path
-        uintptr_t start = strtoull(line.c_str(), nullptr, 16);
-        auto dash = line.find('-');
-        auto space = line.find(' ', dash);
-        auto space2 = line.find(' ', space+1);
-        auto space3 = line.find(' ', space2+1);
-        uintptr_t offset = strtoull(line.c_str() + space3 + 1, nullptr, 16);
-        uintptr_t bias = start - offset;
-        LOGI("load_bias for %s: 0x%lx (start=0x%lx offset=0x%lx)", name, bias, start, offset);
+        uintptr_t start  = strtoull(line.c_str(), nullptr, 16);
+        // offset field is 4th space-separated token
+        const char* p = line.c_str();
+        for (int i = 0; i < 3; i++) { while (*p && *p != ' ') p++; while (*p == ' ') p++; }
+        uintptr_t offset = strtoull(p, nullptr, 16);
+        uintptr_t bias   = start - offset;
+        LOGI("bias=0x%lx start=0x%lx off=0x%lx", bias, start, offset);
         return bias;
     }
     return 0;
 }
 
-static uintptr_t find_lib_base(const char* name) {
-    return find_load_bias(name);
-}
+struct GSList { void* data; void* next; };
 
-// ── valid pointer check ───────────────────────────────────────────────────────
-static bool vptr(uintptr_t v) {
-    return v > 0x10000 && v < 0x7fffffffffff;
-}
+// ── find Assembly-CSharp image ────────────────────────────────────────────────
+static void* find_csharp(void* domain) {
+    // First verify corlib works — this confirms domain is valid
+    auto corlib = FN(fn_vp, RVA_corlib)(domain);
+    LOGI("corlib=%p", corlib);
+    if (!vp((uintptr_t)corlib)) { LOGE("corlib null"); return nullptr; }
 
-// ── valid string check ────────────────────────────────────────────────────────
-static bool valid_str(uintptr_t addr) {
-    if (!vptr(addr)) return false;
-    char buf[128];
-    struct iovec l = { buf, 128 };
-    struct iovec r = { (void*)addr, 128 };
-    if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) <= 0) return false;
-    for (int i = 0; i < 127; i++) {
-        if (buf[i] == 0) return i > 0;
-        if ((unsigned char)buf[i] > 127) return false;
-    }
-    return false;
-}
+    auto img_fn  = FN(fn_vp, RVA_assembly_img);
+    auto name_fn = FN(fn_nm, RVA_image_name);
 
-struct GSList { void* data; GSList* next; };
+    // MonoDomain in Unity Mono has loaded_assemblies (GSList*) 
+    // Scan offsets 0x40-0xB8 safely
+    for (int off = 0x40; off <= 0xB8; off += 8) {
+        uintptr_t list = 0;
+        if (!sr((uintptr_t)domain + off, list) || !vp(list)) continue;
 
-// ── find Assembly-CSharp ──────────────────────────────────────────────────────
-static void* find_csharp_image(void* domain) {
-    auto img_fn  = FN(fn_vp,   RVA_assembly_image);
-    auto name_fn = FN(fn_name, RVA_image_name);
+        // Read first node data to test
+        uintptr_t data0 = 0;
+        if (!sr(list, data0) || !vp(data0)) continue;
 
-    // Try corlib to confirm domain works
-    void* corlib = FN(fn_vp, RVA_corlib)(domain);
-    LOGI("corlib: %p", corlib);
+        // Try img_fn on first data — if it returns valid ptr, this is assembly list
+        void* img0 = img_fn((void*)data0);
+        if (!vp((uintptr_t)img0)) continue;
 
-    // Scan domain offsets 0x40..0xC0 for GSList of assemblies
-    for (int off = 0x40; off <= 0xC0; off += 8) {
-        uintptr_t list_addr = 0;
-        if (!safe_read((uintptr_t)domain + off, list_addr)) continue;
-        if (!vptr(list_addr)) continue;
-
-        // Check if this looks like a GSList by reading first node
-        uintptr_t first_data = 0;
-        if (!safe_read(list_addr, first_data)) continue;
-        if (!vptr(first_data)) continue;
-
-        // Try calling img_fn on first_data
-        void* test_img = img_fn((void*)first_data);
-        uintptr_t test_img_v = (uintptr_t)test_img;
-        if (!vptr(test_img_v)) continue;
-
-        // Looks like a valid assembly list — walk it
-        uintptr_t node_addr = list_addr;
-        for (int i = 0; i < 128; i++) {
+        // Walk the list
+        uintptr_t node = list;
+        for (int i = 0; i < 256 && vp(node); i++) {
             uintptr_t data = 0, next = 0;
-            if (!safe_read(node_addr, data)) break;
-            if (!safe_read(node_addr + 8, next)) break;
-            if (!vptr(data)) { if (!vptr(next)) break; node_addr = next; continue; }
+            if (!sr(node, data) || !sr(node + 8, next)) break;
 
-            void* img = img_fn((void*)data);
-            if (!img || !vptr((uintptr_t)img)) { node_addr = next; continue; }
-
-            uintptr_t name_ptr = 0;
-            if (!safe_read((uintptr_t)img + 0x10, name_ptr) || !valid_str(name_ptr)) {
-                // try calling name_fn
-                const char* name = name_fn(img);
-                if (name && valid_str((uintptr_t)name)) {
-                    LOGI("off=0x%x [%d] %s", off, i, name);
-                    if (strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
-                        return img;
+            if (vp(data)) {
+                void* img = img_fn((void*)data);
+                if (vp((uintptr_t)img)) {
+                    const char* name = name_fn(img);
+                    if (name && vp((uintptr_t)name)) {
+                        // validate string with safe read
+                        char buf[64] = {};
+                        uintptr_t nb = (uintptr_t)name;
+                        struct iovec l2 = { buf, 63 };
+                        struct iovec r2 = { (void*)nb, 63 };
+                        if (process_vm_readv(getpid(), &l2, 1, &r2, 1, 0) > 0) {
+                            LOGI("off=0x%x [%d] %s", off, i, buf);
+                            if (strstr(buf, "Assembly-CSharp") && !strstr(buf, "firstpass"))
+                                return img;
+                        }
+                    }
                 }
-                node_addr = next;
-                continue;
             }
-
-            LOGI("off=0x%x [%d] ptr=0x%lx", off, i, name_ptr);
-            node_addr = next;
-            if (!vptr(next)) break;
+            node = next;
         }
     }
     LOGE("Assembly-CSharp not found");
     return nullptr;
 }
 
-// ── main thread ───────────────────────────────────────────────────────────────
+// ── cheat thread ──────────────────────────────────────────────────────────────
 static void cheat_main() {
-    sleep(15);
+    // Mask thread name to look like Unity internal
+    prctl(PR_SET_NAME, "UnityGfxDevice");
+    
+    sleep(20); // wait for Unity + Mono fully loaded
     LOGI("Starting");
 
-    g_base = find_lib_base("libil2cpp.so");
-    if (!g_base) { LOGE("base not found"); return; }
-    LOGI("base: 0x%lx", g_base);
+    g_bias = find_bias("libil2cpp.so");
+    if (!g_bias) { LOGE("bias not found"); return; }
+    LOGI("bias: 0x%lx", g_bias);
 
+    // Get domain
     void* domain = FN(fn_vv, RVA_domain_get)();
-    if (!domain) domain = FN(fn_vv, RVA_root_domain)();
-    if (!domain) { LOGE("no domain"); return; }
-    LOGI("domain: %p", domain);
+    LOGI("domain_get: %p", domain);
+    if (!vp((uintptr_t)domain)) {
+        domain = FN(fn_vv, RVA_root_domain)();
+        LOGI("root_domain: %p", domain);
+    }
+    if (!vp((uintptr_t)domain)) { LOGE("no domain"); return; }
 
+    // Attach thread to Mono runtime
     FN(fn_ta, RVA_thread_attach)(domain);
     LOGI("thread attached");
 
-    void* img = find_csharp_image(domain);
-    if (!img) { LOGE("image not found"); return; }
-    LOGI("SUCCESS Assembly-CSharp: %p", img);
+    // Find Assembly-CSharp
+    void* img = find_csharp(domain);
+    if (!img) return;
+    LOGI("SUCCESS img=%p", img);
 
     int tick = 0;
     while (true) {
         sleep(2);
-        if (++tick % 5 == 0) LOGI("running tick=%d", tick);
+        if (++tick % 10 == 0) LOGI("tick=%d", tick);
     }
 }
 
@@ -191,20 +160,17 @@ static void cheat_main() {
 class OxideModule : public zygisk::ModuleBase {
     zygisk::Api* api_ = nullptr;
     JNIEnv*      env_ = nullptr;
-    bool         target_ = false;
+    bool         ok_  = false;
 public:
-    void onLoad(zygisk::Api* api, JNIEnv* env) override { api_=api; env_=env; }
+    void onLoad(zygisk::Api* a, JNIEnv* e) override { api_=a; env_=e; }
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         if (!args->nice_name) { api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY); return; }
-        const char* pkg = env_->GetStringUTFChars(args->nice_name, nullptr);
-        if (pkg) {
-            if (strstr(pkg,"catsbit")||strstr(pkg,"oxidesurvival")) target_=true;
-            env_->ReleaseStringUTFChars(args->nice_name, pkg);
-        }
-        if (!target_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        const char* p = env_->GetStringUTFChars(args->nice_name, nullptr);
+        if (p) { if (strstr(p,"catsbit")||strstr(p,"oxidesurvival")) ok_=true; env_->ReleaseStringUTFChars(args->nice_name,p); }
+        if (!ok_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
-        if (!target_) return;
+        if (!ok_) return;
         LOGI("Injected");
         std::thread(cheat_main).detach();
     }
