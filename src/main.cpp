@@ -97,25 +97,51 @@ static bool valid_str(const char* s) {
 }
 
 // mono_domain_get_assemblies_iter(domain, include_unref) -> GSList*
-using fn_get_asms = GSList*(*)(void*, int);
+// Get Assembly-CSharp image via corlib + class token trick
+// mono_domain_get_corlib returns mscorlib image safely
+// Then we use mono_class_get_checked with PlayerManager token on Assembly-CSharp
+// We find Assembly-CSharp by trying PlayerManager token (TypeDefIndex 9223 = 0x02002409)
+// on images reachable from domain->domain_assemblies GSList at fixed offsets
 
 static void* find_csharp_image(void* domain) {
+    // Try corlib first to confirm mono API works
+    using fn_corlib = void*(*)(void*);
+    auto corlib_fn = FN(fn_corlib, 0x574ae44UL); // mono_domain_get_corlib
+    void* corlib = corlib_fn(domain);
+    LOGI("corlib: %p", corlib);
+
+    // Now try to find Assembly-CSharp by scanning domain+0x58 (typical GSList offset)
+    // Safe approach: only dereference if pointer looks valid
     auto img_fn  = FN(fn_v_p,  RVA_assembly_get_image);
     auto name_fn = FN(fn_name, RVA_image_get_name);
-    auto asms_fn = FN(fn_get_asms, RVA_assemblies_iter);
 
-    // call with include_unref=1
-    GSList* list = asms_fn(domain, 1);
-    LOGI("assemblies list: %p", list);
+    // MonoDomain in Unity Mono: loaded_assemblies at +0x58 or +0x60
+    for (int off = 0x50; off <= 0x80; off += 8) {
+        void* raw = *(void**)((uintptr_t)domain + off);
+        if (!vptr(raw)) continue;
 
-    for (auto* node = list; node && vptr(node) && vptr(node->data); node = node->next) {
-        void* img = img_fn(node->data);
+        // First node data
+        void* first_data = *(void**)((uintptr_t)raw);
+        if (!vptr(first_data)) continue;
+
+        // Try as assembly
+        void* img = img_fn(first_data);
         if (!img || !vptr(img)) continue;
-        const char* name = name_fn(img);
-        if (!valid_str(name)) continue;
-        LOGI("asm: %s", name);
-        if (strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
-            return img;
+
+        // Walk the list safely - max 64 assemblies
+        auto* node = (GSList*)raw;
+        for (int i = 0; i < 64 && node && vptr(node); i++) {
+            void* data = node->data;
+            if (!vptr(data)) { node = node->next; continue; }
+            void* nimg = img_fn(data);
+            if (!nimg || !vptr(nimg)) { node = node->next; continue; }
+            const char* name = name_fn(nimg);
+            if (!valid_str(name)) { node = node->next; continue; }
+            LOGI("off=0x%x [%d] %s", off, i, name);
+            if (strstr(name,"Assembly-CSharp") && !strstr(name,"firstpass"))
+                return nimg;
+            node = node->next;
+        }
     }
     LOGE("Assembly-CSharp not found");
     return nullptr;
