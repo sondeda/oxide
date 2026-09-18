@@ -843,15 +843,13 @@ using fn_eglSwap = EGLBoolean(*)(EGLDisplay, EGLSurface);
 static fn_eglSwap g_orig_swap = nullptr;
 
 static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!g_injected.load()) return g_orig_swap(dpy, surf);
-
     // Инициализируем GL один раз с задержкой
     static int frame_cnt = 0;
     frame_cnt++;
 
-    // Первые 300 фреймов (~10 сек) — только вызываем оригинал, ничего не рисуем
-    // Даём Unity полностью загрузиться
-    if (frame_cnt < 300) return g_orig_swap(dpy, surf);
+    // Первые 60 фреймов — только вызываем оригинал
+    if (frame_cnt < 60) return g_orig_swap(dpy, surf);
+    if (frame_cnt % 60 == 0) LOGI("frame=%d gl_ready=%d injected=%d", frame_cnt, (int)g_gl_ready, (int)g_injected.load());
 
     // Инициализируем GL программу один раз
     if (!g_gl_ready) {
