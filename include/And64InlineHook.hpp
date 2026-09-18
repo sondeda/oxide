@@ -50,8 +50,17 @@ static inline void _a64_write_abs_jump(void* where, uintptr_t target_addr) {
 // C-функция которую вызывает каждый трамплин
 // Снимает патч, вызывает оригинал, ставит патч обратно
 // entry_idx — индекс в _a64_entries
+#include <pthread.h>
+static pthread_mutex_t _a64_mutex[16];
+static bool _a64_mutex_init = false;
+
 extern "C" void _a64_restore_call(int entry_idx, void* __this, void* method) {
+    if (!_a64_mutex_init) {
+        for (int i = 0; i < 16; i++) pthread_mutex_init(&_a64_mutex[i], nullptr);
+        _a64_mutex_init = true;
+    }
     A64HookEntry& e = _a64_entries[entry_idx];
+    pthread_mutex_lock(&_a64_mutex[entry_idx]);
     // снять патч
     _a64_mprotect(e.target, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
     memcpy(e.target, e.orig_bytes, 16);
@@ -63,6 +72,7 @@ extern "C" void _a64_restore_call(int entry_idx, void* __this, void* method) {
     memcpy(e.target, e.patch_bytes, 16);
     __builtin___clear_cache((char*)e.target, (char*)e.target + 16);
     _a64_mprotect(e.target, 16, PROT_READ | PROT_EXEC);
+    pthread_mutex_unlock(&_a64_mutex[entry_idx]);
 }
 
 // Трамплин-stub для каждого хука (ARM64 asm)

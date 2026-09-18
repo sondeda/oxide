@@ -845,48 +845,56 @@ static fn_eglSwap g_orig_swap = nullptr;
 static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     if (!g_injected.load()) return g_orig_swap(dpy, surf);
 
-    // init GL program once
+    // Инициализируем GL один раз с задержкой
+    static int frame_cnt = 0;
+    frame_cnt++;
+
+    // Первые 300 фреймов (~10 сек) — только вызываем оригинал, ничего не рисуем
+    // Даём Unity полностью загрузиться
+    if (frame_cnt < 300) return g_orig_swap(dpy, surf);
+
+    // Инициализируем GL программу один раз
     if (!g_gl_ready) {
-        if (init_gl()) g_gl_ready = true;
-        // читаем размер экрана через EGL — без IL2CPP вызовов
-        EGLDisplay cur_dpy  = eglGetCurrentDisplay();
-        EGLSurface cur_surf = eglGetCurrentSurface(EGL_DRAW);
-        if (cur_surf != EGL_NO_SURFACE) {
-            EGLint w = 0, h = 0;
-            eglQuerySurface(cur_dpy, cur_surf, EGL_WIDTH,  &w);
-            eglQuerySurface(cur_dpy, cur_surf, EGL_HEIGHT, &h);
-            if (w > 0 && h > 0) { g_scr_w = w; g_scr_h = h; }
+        // Читаем размер через EGL
+        EGLint w = 0, h = 0;
+        eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
+        eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+        if (w > 100 && h > 100) {
+            g_scr_w = w; g_scr_h = h;
+            LOGI("screen: %dx%d", g_scr_w, g_scr_h);
+            if (init_gl()) {
+                g_gl_ready = true;
+                LOGI("GL ready");
+            }
         }
-        LOGI("screen via EGL: %dx%d", g_scr_w, g_scr_h);
+        return g_orig_swap(dpy, surf);
     }
 
-    if (g_gl_ready && g_prog) {
-        glUseProgram(g_prog);
-        glUniform2f(g_uloc_res, (float)g_scr_w, (float)g_scr_h);
+    // Рендер
+    glUseProgram(g_prog);
+    glUniform2f(g_uloc_res, (float)g_scr_w, (float)g_scr_h);
 
-        // save & set GL state
-        GLboolean old_blend, old_depth;
-        glGetBooleanv(GL_BLEND,       &old_blend);
-        glGetBooleanv(GL_DEPTH_TEST,  &old_depth);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_DEPTH_TEST);
+    GLboolean old_blend, old_depth;
+    glGetBooleanv(GL_BLEND,      &old_blend);
+    glGetBooleanv(GL_DEPTH_TEST, &old_depth);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
 
-        // render
-        render_watermark();
-        check_menu_toggle();
-        render_menu();
-        render_esp();
+    render_watermark();
+    check_menu_toggle();
+    render_menu();
+    render_esp();
 
-        // restore GL state
-        if (!old_blend) glDisable(GL_BLEND);
-        if (old_depth)  glEnable(GL_DEPTH_TEST);
-        glUseProgram(0);
-        glDisableVertexAttribArray(g_aloc_pos);
-    }
+    if (!old_blend) glDisable(GL_BLEND);
+    if (old_depth)  glEnable(GL_DEPTH_TEST);
+    glUseProgram(0);
+    if (g_aloc_pos >= 0) glDisableVertexAttribArray((GLuint)g_aloc_pos);
 
     return g_orig_swap(dpy, surf);
 }
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PlayerManager hooks
