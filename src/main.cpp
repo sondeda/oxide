@@ -419,6 +419,91 @@ static EGLBoolean hook_swap(EGLDisplay dpy,EGLSurface surf){
 }
 
 // ── Установка хуков ───────────────────────────────────────────────────────────
+// Найти базовый адрес библиотеки в памяти
+static uintptr_t find_lib_base_full(const char* name) {
+    std::ifstream f("/proc/self/maps");
+    std::string line;
+    while(std::getline(f, line)) {
+        if(line.find(name) == std::string::npos) continue;
+        if(line.find("r--p") == std::string::npos &&
+           line.find("r-xp") == std::string::npos) continue;
+        uintptr_t addr = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
+        if(addr > 0x1000) return addr;
+    }
+    return 0;
+}
+
+// Найти символ в ELF по базовому адресу (ручной парсинг)
+#include <elf.h>
+static void* elf_find_sym(uintptr_t base, const char* symname) {
+    if(!base) return nullptr;
+    auto* ehdr = (Elf64_Ehdr*)base;
+    if(ehdr->e_ident[0] != 0x7f) return nullptr;
+
+    auto* phdr = (Elf64_Phdr*)(base + ehdr->e_phoff);
+    uintptr_t load_bias = 0;
+    for(int i = 0; i < ehdr->e_phnum; i++) {
+        if(phdr[i].p_type == PT_LOAD && phdr[i].p_offset == 0) {
+            load_bias = base - phdr[i].p_vaddr;
+            break;
+        }
+    }
+
+    // Ищем dynamic section
+    Elf64_Dyn* dyn = nullptr;
+    for(int i = 0; i < ehdr->e_phnum; i++) {
+        if(phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (Elf64_Dyn*)(load_bias + phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if(!dyn) return nullptr;
+
+    Elf64_Sym*  symtab = nullptr;
+    const char* strtab = nullptr;
+    uint32_t*   gnu_hash = nullptr;
+    Elf64_Sym*  dynsym = nullptr;
+    size_t      dynsym_cnt = 0;
+
+    for(auto* d = dyn; d->d_tag != DT_NULL; d++) {
+        if(d->d_tag == DT_SYMTAB) symtab = (Elf64_Sym*)(load_bias + d->d_un.d_ptr);
+        if(d->d_tag == DT_STRTAB) strtab = (const char*)(load_bias + d->d_un.d_ptr);
+        if(d->d_tag == DT_GNU_HASH) gnu_hash = (uint32_t*)(load_bias + d->d_un.d_ptr);
+    }
+    if(!symtab || !strtab) return nullptr;
+
+    // Получаем кол-во символов через GNU_HASH
+    if(gnu_hash) {
+        uint32_t nbuckets = gnu_hash[0];
+        uint32_t symoffset = gnu_hash[1];
+        uint32_t bloom_size = gnu_hash[2];
+        uint32_t* buckets = gnu_hash + 4 + bloom_size * 2;
+        uint32_t* chain = buckets + nbuckets;
+        uint32_t max_sym = symoffset;
+        for(uint32_t i = 0; i < nbuckets; i++) {
+            uint32_t b = buckets[i];
+            if(b == 0) continue;
+            uint32_t idx = b;
+            while(!(chain[idx - symoffset] & 1)) idx++;
+            if(idx > max_sym) max_sym = idx;
+        }
+        dynsym_cnt = max_sym + 1;
+    } else {
+        dynsym_cnt = 4096; // fallback
+    }
+    dynsym = symtab;
+
+    for(size_t i = 0; i < dynsym_cnt; i++) {
+        if(dynsym[i].st_name == 0) continue;
+        if(dynsym[i].st_value == 0) continue;
+        const char* name = strtab + dynsym[i].st_name;
+        if(strcmp(name, symname) == 0) {
+            return (void*)(load_bias + dynsym[i].st_value);
+        }
+    }
+    return nullptr;
+}
+
 static void install(){
     // PlayerManager хуки
     A64HookFunction(rva(RVA_PM_Awake),    (void*)hook_Awake,     (void**)&g_orig_aw);
@@ -426,55 +511,90 @@ static void install(){
     A64HookFunction(rva(RVA_PM_OnDis),    (void*)hook_OnDisable, (void**)&g_orig_dis);
     LOGI("PlayerManager hooks done");
 
-    // Хукаем eglSwapBuffers из ВСЕХ загруженных либ
-    // Сначала системный libEGL.so
-    auto hook_egl_from = [](const char* libname) -> bool {
-        void* h = dlopen(libname, RTLD_LAZY|RTLD_NOLOAD);
-        if(!h) h = dlopen(libname, RTLD_LAZY);
-        if(!h) return false;
-        void* fn = dlsym(h, "eglSwapBuffers");
-        if(!fn) return false;
-        bool ok = A64HookFunction(fn, (void*)hook_swap, (void**)&g_orig_swap);
-        LOGI("eglSwapBuffers from %s: %s fn=%p", libname, ok?"OK":"FAIL", fn);
-        return ok;
-    };
-
-    // Пробуем все варианты
     bool egl_hooked = false;
-    egl_hooked |= hook_egl_from("libEGL.so");
 
-    // Ищем libunity.so по полному пути
-    std::string unity_path;
-    {
-        std::ifstream maps("/proc/self/maps");
-        std::string line;
-        while(std::getline(maps,line)){
-            if(line.find("libunity.so")==std::string::npos) continue;
-            auto sl=line.find('/');
-            if(sl==std::string::npos) continue;
-            unity_path=line.substr(sl);
-            while(!unity_path.empty()&&(unity_path.back()=='\n'||unity_path.back()==' '))
-                unity_path.pop_back();
-            break;
+    // 1. Хукаем eglSwapBuffers в системном libEGL.so
+    uintptr_t egl_base = find_lib_base_full("libEGL.so");
+    LOGI("libEGL base: 0x%lx", egl_base);
+    if(egl_base) {
+        void* fn = elf_find_sym(egl_base, "eglSwapBuffers");
+        LOGI("libEGL eglSwapBuffers sym: %p", fn);
+        if(fn) {
+            bool ok = A64HookFunction(fn, (void*)hook_swap, (void**)&g_orig_swap);
+            LOGI("libEGL hook: %s", ok?"OK":"FAIL");
+            egl_hooked |= ok;
         }
     }
-    LOGI("libunity path: %s", unity_path.c_str());
 
-    if(!unity_path.empty()){
-        void* uh = dlopen(unity_path.c_str(), RTLD_LAZY|RTLD_GLOBAL);
-        LOGI("libunity dlopen: %s", uh?"OK":dlerror());
-        if(uh){
-            void* fn = dlsym(uh,"eglSwapBuffers");
-            LOGI("libunity eglSwapBuffers: %p", fn);
-            if(fn && !egl_hooked){
-                bool ok=A64HookFunction(fn,(void*)hook_swap,(void**)&g_orig_swap);
-                LOGI("libunity eglSwap hook: %s",ok?"OK":"FAIL");
-                egl_hooked|=ok;
+    // 2. Хукаем eglSwapBuffers в libunity.so (у Unity своя копия)
+    uintptr_t unity_base = find_lib_base_full("libunity.so");
+    LOGI("libunity base: 0x%lx", unity_base);
+    if(unity_base) {
+        void* fn = elf_find_sym(unity_base, "eglSwapBuffers");
+        LOGI("libunity eglSwapBuffers sym: %p", fn);
+        if(fn && fn != elf_find_sym(egl_base, "eglSwapBuffers")) {
+            bool ok = A64HookFunction(fn, (void*)hook_swap, (void**)&g_orig_swap);
+            LOGI("libunity eglSwap hook: %s", ok?"OK":"FAIL");
+            egl_hooked |= ok;
+        }
+        // Также пробуем ANativeWindow_setBuffersGeometry как fallback
+        // (некоторые Unity версии используют его для swap)
+    }
+
+    // 3. Хукаем через GOT libunity.so если прямой экспорт не нашёлся
+    // GOT-патчинг: находим PLT entry для eglSwapBuffers внутри libunity.so
+    if(!egl_hooked && unity_base) {
+        // Ищем паттерн вызова eglSwapBuffers в .got.plt секции libunity.so
+        auto* ehdr = (Elf64_Ehdr*)unity_base;
+        auto* shdr = (Elf64_Shdr*)(unity_base + ehdr->e_shoff);
+        // e_shoff может быть 0 в stripped lib — используем dynamic approach
+        // Ищем .rela.plt
+        uintptr_t load_bias = 0;
+        auto* phdr = (Elf64_Phdr*)(unity_base + ehdr->e_phoff);
+        for(int i=0;i<ehdr->e_phnum;i++){
+            if(phdr[i].p_type==PT_LOAD&&phdr[i].p_offset==0){
+                load_bias=unity_base-phdr[i].p_vaddr; break;
+            }
+        }
+        Elf64_Dyn* dyn=nullptr;
+        for(int i=0;i<ehdr->e_phnum;i++){
+            if(phdr[i].p_type==PT_DYNAMIC){
+                dyn=(Elf64_Dyn*)(load_bias+phdr[i].p_vaddr); break;
+            }
+        }
+        if(dyn){
+            Elf64_Rela* rela_plt=nullptr; size_t rela_plt_sz=0;
+            Elf64_Sym* symtab=nullptr; const char* strtab=nullptr;
+            for(auto* d=dyn;d->d_tag!=DT_NULL;d++){
+                if(d->d_tag==DT_JMPREL) rela_plt=(Elf64_Rela*)(load_bias+d->d_un.d_ptr);
+                if(d->d_tag==DT_PLTRELSZ) rela_plt_sz=d->d_un.d_val/sizeof(Elf64_Rela);
+                if(d->d_tag==DT_SYMTAB) symtab=(Elf64_Sym*)(load_bias+d->d_un.d_ptr);
+                if(d->d_tag==DT_STRTAB) strtab=(const char*)(load_bias+d->d_un.d_ptr);
+            }
+            if(rela_plt&&symtab&&strtab){
+                for(size_t i=0;i<rela_plt_sz;i++){
+                    uint32_t sym_idx=ELF64_R_SYM(rela_plt[i].r_info);
+                    const char* name=strtab+symtab[sym_idx].st_name;
+                    if(strcmp(name,"eglSwapBuffers")==0){
+                        // GOT entry
+                        void** got=(void**)(load_bias+rela_plt[i].r_offset);
+                        LOGI("libunity GOT eglSwapBuffers: %p -> %p", got, *got);
+                        // Сохраняем оригинал из GOT
+                        g_orig_swap=(fn_swap)*got;
+                        // Патчим GOT
+                        _a64_protect(got, PROT_READ|PROT_WRITE|PROT_EXEC);
+                        *got=(void*)hook_swap;
+                        _a64_protect(got, PROT_READ|PROT_EXEC);
+                        LOGI("GOT patch done, orig=%p", g_orig_swap);
+                        egl_hooked=true;
+                        break;
+                    }
+                }
             }
         }
     }
 
-    LOGI("all hooks done. egl_hooked=%d",(int)egl_hooked);
+    LOGI("all hooks done. egl_hooked=%d", (int)egl_hooked);
 }
 
 // ── Zygisk ────────────────────────────────────────────────────────────────────
