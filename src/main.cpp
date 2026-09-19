@@ -980,19 +980,50 @@ static void install_hooks() {
         LOGE("libEGL.so dlopen failed");
     }
 
-    // Пробуем Vulkan (Unity 6 на Android 16 использует Vulkan по умолчанию)
-    void* vk_lib = dlopen("libvulkan.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!vk_lib) vk_lib = dlopen("libvulkan.so", RTLD_LAZY);
-    if (vk_lib) {
-        void* vk_fn = dlsym(vk_lib, "vkQueuePresentKHR");
+    // Vulkan через libunity.so — Unity грузит Vulkan сам, не через системный libvulkan
+    // Ищем vkQueuePresentKHR внутри libunity.so
+    void* unity_lib = dlopen("libunity.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (unity_lib) {
+        void* vk_fn = dlsym(unity_lib, "vkQueuePresentKHR");
         if (vk_fn) {
             bool ok = A64HookFunction(vk_fn, (void*)hooked_vkQueuePresentKHR, (void**)&g_orig_vkPresent);
-            LOGI("vkQueuePresentKHR hook: %s", ok ? "OK" : "FAIL");
+            LOGI("libunity.so vkQueuePresentKHR hook: %s", ok ? "OK" : "FAIL");
             if (ok) g_using_vulkan = true;
+        } else {
+            LOGI("vkQueuePresentKHR not exported from libunity.so — scanning maps");
+        }
+    } else {
+        LOGI("libunity.so not found via dlopen");
+    }
+
+    // Если Vulkan не нашли — ищем eglSwapBuffers в libunity.so
+    if (!g_using_vulkan && unity_lib) {
+        void* egl_fn = dlsym(unity_lib, "eglSwapBuffers");
+        if (egl_fn) {
+            bool ok = A64HookFunction(egl_fn, (void*)hooked_eglSwapBuffers, (void**)&g_orig_swap);
+            LOGI("libunity.so eglSwapBuffers hook: %s", ok ? "OK" : "FAIL");
         }
     }
 
     LOGI("all hooks installed (vulkan=%d)", (int)g_using_vulkan);
+
+    // Логируем какие render-библиотеки загружены — для диагностики
+    {
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        bool found_egl = false, found_vk = false, found_unity = false;
+        while (std::getline(maps, line)) {
+            if (line.find("libEGL") != std::string::npos && !found_egl) {
+                LOGI("render lib: %s", line.c_str()); found_egl = true;
+            }
+            if (line.find("libvulkan") != std::string::npos && !found_vk) {
+                LOGI("render lib: %s", line.c_str()); found_vk = true;
+            }
+            if (line.find("libunity") != std::string::npos && !found_unity) {
+                LOGI("unity lib: %s", line.c_str()); found_unity = true;
+            }
+        }
+    }
 
     // запускаем тред чтения тачскрина
     std::thread(touch_reader_thread).detach();
