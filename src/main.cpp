@@ -378,8 +378,55 @@ static void check_toggle(){
 
 // ── EGL hook ──────────────────────────────────────────────────────────────────
 using fn_swap=EGLBoolean(*)(EGLDisplay,EGLSurface);
+using fn_vkpresent=VkResult(*)(VkQueue,const VkPresentInfoKHR*);
+static fn_vkpresent g_orig_vkpresent=nullptr;
 static fn_swap g_orig_swap=nullptr;
 static int g_frame=0;
+
+static VkResult hook_vkPresent(VkQueue q, const VkPresentInfoKHR* p){
+    g_frame++;
+    if(g_frame<=3) LOGI("VK PRESENT CALLED frame=%d",g_frame);
+    if(g_frame%600==0) LOGI("vkframe=%d gl=%d",g_frame,(int)g_gl_ok);
+
+    // Получаем EGL контекст через eglGetCurrentDisplay
+    if(g_frame>30 && !g_gl_ok){
+        EGLDisplay dpy=eglGetCurrentDisplay();
+        EGLSurface surf=eglGetCurrentSurface(EGL_DRAW);
+        LOGI("vk path egl: dpy=%p surf=%p",(void*)dpy,(void*)surf);
+        if(dpy!=EGL_NO_DISPLAY && surf!=EGL_NO_SURFACE){
+            EGLint w=0,h=0;
+            eglQuerySurface(dpy,surf,EGL_WIDTH,&w);
+            eglQuerySurface(dpy,surf,EGL_HEIGHT,&h);
+            if(w>100&&h>100){g_sw=w;g_sh=h;}
+        } else {
+            // Vulkan — нет EGL контекста, используем дефолтное разрешение
+            g_sw=1080; g_sh=2400;
+        }
+        if(gl_init()) g_gl_ok=true;
+        LOGI("GL init from VK path: %dx%d ok=%d",g_sw,g_sh,(int)g_gl_ok);
+    }
+
+    if(g_gl_ok){
+        glUseProgram(g_prog);
+        glUniform2f(g_uloc_res,(float)g_sw,(float)g_sh);
+        GLboolean ob,od;
+        glGetBooleanv(GL_BLEND,&ob);
+        glGetBooleanv(GL_DEPTH_TEST,&od);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_DEPTH_TEST);
+        draw_watermark();
+        check_toggle();
+        draw_menu();
+        draw_esp();
+        if(!ob)glDisable(GL_BLEND);
+        if(od)glEnable(GL_DEPTH_TEST);
+        glUseProgram(0);
+        if(g_aloc_pos>=0)glDisableVertexAttribArray((GLuint)g_aloc_pos);
+    }
+
+    return g_orig_vkpresent(q,p);
+}
 
 static EGLBoolean hook_swap(EGLDisplay dpy,EGLSurface surf){
     g_frame++;
@@ -541,9 +588,49 @@ static void install(){
         // (некоторые Unity версии используют его для swap)
     }
 
-    // GOT патч убран — crashes on mprotect
-    // libEGL хук достаточен если Unity вызывает через него
-    LOGI("skipping GOT patch");
+    // GOT патч vkQueuePresentKHR в libunity.so
+    if(unity_base){
+        uintptr_t lb=0;
+        auto* eh=(Elf64_Ehdr*)unity_base;
+        auto* ph=(Elf64_Phdr*)(unity_base+eh->e_phoff);
+        for(int i=0;i<eh->e_phnum;i++){
+            if(ph[i].p_type==PT_LOAD&&ph[i].p_offset==0){lb=unity_base-ph[i].p_vaddr;break;}
+        }
+        Elf64_Dyn* dn=nullptr;
+        for(int i=0;i<eh->e_phnum;i++){
+            if(ph[i].p_type==PT_DYNAMIC){dn=(Elf64_Dyn*)(lb+ph[i].p_vaddr);break;}
+        }
+        if(dn){
+            Elf64_Rela* rela=nullptr; size_t rsz=0;
+            Elf64_Sym* sym=nullptr; const char* str=nullptr;
+            for(auto* d=dn;d->d_tag!=DT_NULL;d++){
+                if(d->d_tag==DT_JMPREL)   rela=(Elf64_Rela*)(lb+d->d_un.d_ptr);
+                if(d->d_tag==DT_PLTRELSZ) rsz=d->d_un.d_val/sizeof(Elf64_Rela);
+                if(d->d_tag==DT_SYMTAB)   sym=(Elf64_Sym*)(lb+d->d_un.d_ptr);
+                if(d->d_tag==DT_STRTAB)   str=(const char*)(lb+d->d_un.d_ptr);
+            }
+            LOGI("VK GOT scan rela=%p sz=%zu",rela,rsz);
+            if(rela&&sym&&str&&rsz>0&&rsz<200000){
+                for(size_t i=0;i<rsz;i++){
+                    uint32_t si=ELF64_R_SYM(rela[i].r_info);
+                    if(!sym[si].st_name) continue;
+                    const char* nm=str+sym[si].st_name;
+                    if(strcmp(nm,"vkQueuePresentKHR")==0){
+                        void** got=(void**)(lb+rela[i].r_offset);
+                        LOGI("VK GOT found: %p -> %p",got,*got);
+                        g_orig_vkpresent=(fn_vkpresent)*got;
+                        // Патчим страницу
+                        uintptr_t pg=(uintptr_t)got&~(uintptr_t)(getpagesize()-1);
+                        mprotect((void*)pg,getpagesize()*2,PROT_READ|PROT_WRITE);
+                        *got=(void*)hook_vkPresent;
+                        mprotect((void*)pg,getpagesize()*2,PROT_READ);
+                        LOGI("VK GOT patched orig=%p",g_orig_vkpresent);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
         LOGI("all hooks done. egl_hooked=%d", (int)egl_hooked);
 }
