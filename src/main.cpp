@@ -1,19 +1,12 @@
-// language: C++17, file: src/main.cpp, target: Android arm64-v8a, Unity IL2CPP (Oxide)
-// build: CMakeLists.txt (add EGL + GLESv2 to target_link_libraries)
-//
-// Architecture:
-//   1. shadowhook loaded from libshadowhook.so (already in game process)
-//   2. Hook PlayerManager::Awake   — inject confirmation
-//   3. Hook PlayerManager::OnEnable  — add player to tracked list
-//   4. Hook PlayerManager::OnDisable — remove from list
-//   5. Hook eglSwapBuffers — render ESP + menu (render thread = Unity's own thread)
-//   6. Inside render hook: call Camera::get_main() + WorldToScreenPoint() by RVA (safe — render thread is attached)
-//   7. Read player data by direct field offsets (no Mono API, no crash)
+// BobaDLC External — Oxide Survival Island
+// Author: Lotusor
+// Рендер: Android SurfaceFlinger overlay через /dev/graphics/fb0 fallback
+// или через JNI Canvas overlay
+// Хуки: And64InlineHook (pure C++)
 
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <jni.h>
 #include <android/log.h>
+#include <android/native_window.h>
 #include <unistd.h>
 #include <dlfcn.h>
 #include <string>
@@ -27,1059 +20,503 @@
 #include <vector>
 #include <algorithm>
 #include <atomic>
+#include <sys/stat.h>
+#include <linux/input.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
-#include <vulkan/vulkan.h>
 #include "zygisk.hpp"
 #include "And64InlineHook.hpp"
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Logging
-// ─────────────────────────────────────────────────────────────────────────────
 #define TAG  "LotusorCheat"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RVAs confirmed from Dump0/script.json + dump.cs (do NOT change)
-// ─────────────────────────────────────────────────────────────────────────────
-static constexpr uintptr_t RVA_PM_Awake         = 0x6685fd4UL;
-static constexpr uintptr_t RVA_PM_OnEnable      = 0x66730a8UL;
-static constexpr uintptr_t RVA_PM_OnDisable     = 0x667bd7cUL;
-static constexpr uintptr_t RVA_PM_Update        = 0x6684014UL;
-static constexpr uintptr_t RVA_Cam_GetMain      = 0xc73b4ecUL; // static, no __this
-static constexpr uintptr_t RVA_Cam_W2S          = 0xc73aa40UL; // (Camera*, Vec3, MethodInfo*)->Vec3
+// ── RVAs из дампа ────────────────────────────────────────────────────────────
+static constexpr uintptr_t RVA_PM_Awake    = 0x6685fd4UL;
+static constexpr uintptr_t RVA_PM_OnEnable = 0x66730a8UL;
+static constexpr uintptr_t RVA_PM_OnDis    = 0x667bd7cUL;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PlayerManager field offsets (from dump.cs TypeDefIndex: 9223)
-// ─────────────────────────────────────────────────────────────────────────────
-static constexpr uintptr_t OFF_PM_playerEventHandler = 0x78;  // Gum*  (extends GuB which has DisplayName+Health)
-static constexpr uintptr_t OFF_PM_vitals             = 0xC8;  // PlayerVitals*
-static constexpr uintptr_t OFF_PM_lastTickPosition   = 0x1C8; // Vector3 (server position, close enough for ESP)
-static constexpr uintptr_t OFF_PM_userID             = 0x278; // Il2CppString*
-static constexpr uintptr_t OFF_PM_isImmortal         = 0x2B1; // bool
-static constexpr uintptr_t OFF_PM_prime              = 0x254; // bool
+// ── Офсеты полей PlayerManager ───────────────────────────────────────────────
+static constexpr uintptr_t OFF_PM_peh  = 0x78;   // Gum* playerEventHandler
+static constexpr uintptr_t OFF_GuB_Nm  = 0x88;   // Il2CppString* DisplayName
+static constexpr uintptr_t OFF_GuB_HP  = 0x98;   // Gun<float>* Health
+static constexpr uintptr_t OFF_GUN_Val = 0x18;   // float current value
+static constexpr uintptr_t OFF_PM_Pos  = 0x1C8;  // Vector3 lastTickPosition
 
-// GuB (base of Gum/playerEventHandler) field offsets
-static constexpr uintptr_t OFF_GuB_DisplayName = 0x88;  // Il2CppString*
-static constexpr uintptr_t OFF_GuB_Health      = 0x98;  // Gun<float,?>* (heap obj)
-static constexpr uintptr_t OFF_GUN_float_value = 0x18;  // float LMj inside Gun<float,?> object
-
-// ─────────────────────────────────────────────────────────────────────────────
-// IL2CPP struct helpers
-// ─────────────────────────────────────────────────────────────────────────────
 struct Vec3 { float x, y, z; };
-struct Vec2 { float x, y; };
 
-// Il2CppString: [klass 8][monitor 8][length 4][chars ...]
-static std::string read_il2cpp_string(void* str_ptr) {
-    if (!str_ptr) return "";
-    int32_t len = *(int32_t*)((uintptr_t)str_ptr + 0x10);
-    if (len <= 0 || len > 128) return "";
-    const uint16_t* chars = (const uint16_t*)((uintptr_t)str_ptr + 0x14);
-    std::string out;
-    out.reserve((size_t)len);
-    for (int i = 0; i < len; i++) {
-        uint16_t c = chars[i];
-        out += (c < 128) ? (char)c : '?';
-    }
-    return out;
-}
+// ── Базовый адрес ─────────────────────────────────────────────────────────────
+static uintptr_t g_base = 0;
 
-// Safe dereference with trivial validity check
-static inline void* safe_ptr(void* ptr) {
-    // just check non-null and not obviously bad; no SIGSEGV guard here —
-    // game objects live in managed heap and are valid while PlayerManager is alive
-    return ((uintptr_t)ptr > 0x1000) ? ptr : nullptr;
-}
-
-template<typename T>
-static inline T read_field(void* obj, uintptr_t offset) {
-    return *(T*)((uintptr_t)obj + offset);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Base address
-// ─────────────────────────────────────────────────────────────────────────────
-static uintptr_t g_il2cpp_base = 0;
-
-static uintptr_t find_lib_base(const char* libname) {
-    std::ifstream maps("/proc/self/maps");
+static uintptr_t find_base(const char* lib) {
+    std::ifstream f("/proc/self/maps");
     std::string line;
-    while (std::getline(maps, line)) {
-        if (line.find(libname) == std::string::npos) continue;
-        // want r--p or r-xp mapping at offset 0
-        size_t perm_start = line.find(' ');
-        if (perm_start == std::string::npos) continue;
-        std::string perm = line.substr(perm_start + 1, 4);
-        if (perm[0] != 'r') continue;
-        // offset must be 00000000
-        size_t col2 = line.find(' ', perm_start + 5);
-        if (col2 == std::string::npos) continue;
-        std::string offset_str = line.substr(col2 + 1, 8);
-        if (offset_str != "00000000") continue;
-        uintptr_t start = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
-        if (*(uint32_t*)start == 0x464C457F) return start;
+    while (std::getline(f, line)) {
+        if (line.find(lib) == std::string::npos) continue;
+        if (line.find("r--p") == std::string::npos &&
+            line.find("r-xp") == std::string::npos) continue;
+        if (line.find("00000000") == std::string::npos) continue;
+        uintptr_t addr = (uintptr_t)strtoull(line.c_str(), nullptr, 16);
+        if (*(uint32_t*)addr == 0x464C457F) return addr;
     }
     return 0;
 }
 
-static inline void* rva(uintptr_t offset) {
-    return (void*)(g_il2cpp_base + offset);
-}
+static inline void* rva(uintptr_t off) { return (void*)(g_base + off); }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Hook loader — And64InlineHook (embedded, no external deps)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static bool do_hook(uintptr_t rva_offset, void* hook_fn, void** orig) {
-    void* target = rva(rva_offset);
-    bool ok = A64HookFunction(target, hook_fn, orig);
-    if (!ok) { LOGE("A64Hook FAILED at RVA 0x%lx", rva_offset); return false; }
-    LOGI("A64Hook OK at RVA 0x%lx  orig=%p", rva_offset, orig ? *orig : nullptr);
-    return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Player registry
-// ─────────────────────────────────────────────────────────────────────────────
-struct PlayerInfo {
-    void*       pm_ptr;
-    Vec3        pos;
-    float       health;
-    float       max_health;
-    std::string display_name;
-    bool        is_local;
-};
-
-static std::mutex           g_players_mutex;
-static std::vector<void*>   g_players;      // raw PlayerManager* pointers
-static void*                g_local_pm = nullptr;
-static std::atomic<bool>    g_injected{false};
+// ── Игроки ───────────────────────────────────────────────────────────────────
+static std::mutex        g_mtx;
+static std::vector<void*> g_players;
+static void*             g_local = nullptr;
+static std::atomic<bool> g_ok{false};
 
 static void add_player(void* pm) {
-    std::lock_guard<std::mutex> lk(g_players_mutex);
+    std::lock_guard<std::mutex> lk(g_mtx);
     for (auto p : g_players) if (p == pm) return;
     g_players.push_back(pm);
-    LOGI("player added: %p  total=%zu", pm, g_players.size());
+    LOGI("player+ %p total=%zu", pm, g_players.size());
+}
+static void del_player(void* pm) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_players.erase(std::remove(g_players.begin(), g_players.end(), pm), g_players.end());
+    if (g_local == pm) g_local = nullptr;
 }
 
-static void remove_player(void* pm) {
-    std::lock_guard<std::mutex> lk(g_players_mutex);
-    auto it = std::find(g_players.begin(), g_players.end(), pm);
-    if (it != g_players.end()) g_players.erase(it);
-    if (g_local_pm == pm) g_local_pm = nullptr;
-}
-
-// read a PlayerInfo snapshot from a live PlayerManager*
-static PlayerInfo snapshot_player(void* pm) {
-    PlayerInfo pi{};
-    pi.pm_ptr = pm;
-    pi.is_local = (pm == g_local_pm);
-
-    // position
-    pi.pos = read_field<Vec3>(pm, OFF_PM_lastTickPosition);
-
-    // health via playerEventHandler (Gum extends GuB which has Health)
-    void* peh = safe_ptr(read_field<void*>(pm, OFF_PM_playerEventHandler));
-    if (peh) {
-        void* health_gun = safe_ptr(read_field<void*>(peh, OFF_GuB_Health));
-        if (health_gun) {
-            pi.health = read_field<float>(health_gun, OFF_GUN_float_value);
-        }
-        // display name
-        void* name_str = safe_ptr(read_field<void*>(peh, OFF_GuB_DisplayName));
-        if (name_str) {
-            pi.display_name = read_il2cpp_string(name_str);
-        }
-    }
-
-    // max health from vitals/GenericVitals chain
-    // PlayerVitals → EntityVitals → GenericVitals (m_MaxHealth @ 0x88 within GenericVitals)
-    // GenericVitals starts at its base class chain. Determined from dump:
-    // NetworkBehaviour(~0x68) + Guy(0x68+0x10=0x78 total for Entity+bounds)
-    // GenericVitals m_MaxHealth @ 0x88 (absolute from obj start)
-    void* vitals = safe_ptr(read_field<void*>(pm, OFF_PM_vitals));
-    if (vitals) {
-        pi.max_health = read_field<float>(vitals, 0x88);
-        if (pi.max_health <= 0.f || pi.max_health > 10000.f) pi.max_health = 100.f;
-    } else {
-        pi.max_health = 100.f;
-    }
-
-    if (pi.display_name.empty()) pi.display_name = "Player";
-    return pi;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Menu state
-// ─────────────────────────────────────────────────────────────────────────────
-struct MenuState {
-    bool visible         = false;
-    int  active_tab      = 0; // 0=Aimbot 1=Visuals 2=Misc 3=Skins
-    bool esp_enabled     = true;
-    bool esp_box         = true;
-    bool esp_health      = true;
-    bool esp_name        = true;
-    bool aimbot_enabled  = false;
-    bool aimbot_silent   = false;
-    bool aimbot_vis_only = true;
-    bool no_recoil       = false;
-    float esp_max_dist   = 500.f;
-};
-static MenuState g_menu;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Camera calls by RVA (safe to call from render thread — it's Unity's own thread)
-// ─────────────────────────────────────────────────────────────────────────────
-using fn_cam_getmain = void*(*)(void* method_info);
-using fn_cam_w2s     = Vec3(*)(void* camera, Vec3 pos, void* method_info);
-using fn_cam_pw      = int(*)(void* camera, void* method_info);
-using fn_cam_ph      = int(*)(void* camera, void* method_info);
-
-static fn_cam_getmain g_cam_getmain = nullptr;
-static fn_cam_w2s     g_cam_w2s     = nullptr;
-static fn_cam_pw      g_cam_pw      = nullptr;
-static fn_cam_ph      g_cam_ph      = nullptr;
-
-static void init_camera_fns() {
-    g_cam_getmain = (fn_cam_getmain)rva(RVA_Cam_GetMain);
-    g_cam_w2s     = (fn_cam_w2s)    rva(RVA_Cam_W2S);
-    g_cam_pw      = (fn_cam_pw)     rva(0xc739174UL);
-    g_cam_ph      = (fn_cam_ph)     rva(0xc739228UL);
-}
-
-// world→screen, returns false if behind camera (z < 0)
-static bool world_to_screen(void* cam, const Vec3& world, Vec2& out) {
-    Vec3 s = g_cam_w2s(cam, world, nullptr);
-    if (s.z < 0.f) return false;
-    out.x = s.x;
-    out.y = s.y;
-    return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OpenGL ES 2.0 renderer
-// ─────────────────────────────────────────────────────────────────────────────
-static GLuint  g_prog  = 0;
-static GLint   g_uloc_res   = -1;
-static GLint   g_uloc_color = -1;
-static GLint   g_aloc_pos   = -1;
-static int     g_scr_w = 1280, g_scr_h = 720;
-static bool    g_gl_ready   = false;
-
-static const char* k_vs =
-    "attribute vec2 aPos;\n"
-    "uniform vec2 uRes;\n"
-    "void main() {\n"
-    "  vec2 p = aPos / uRes * 2.0 - 1.0;\n"
-    "  gl_Position = vec4(p.x, -p.y, 0.0, 1.0);\n"
-    "}\n";
-
-static const char* k_fs =
-    "precision mediump float;\n"
-    "uniform vec4 uColor;\n"
-    "void main() { gl_FragColor = uColor; }\n";
-
-static GLuint compile_shader(GLenum type, const char* src) {
-    GLuint s = glCreateShader(type);
-    glShaderSource(s, 1, &src, nullptr);
-    glCompileShader(s);
+static std::string read_str(void* p) {
+    if (!p || (uintptr_t)p < 0x1000) return "";
+    int32_t len = *(int32_t*)((uintptr_t)p + 0x10);
+    if (len <= 0 || len > 64) return "";
+    const uint16_t* ch = (const uint16_t*)((uintptr_t)p + 0x14);
+    std::string s; s.reserve(len);
+    for (int i = 0; i < len; i++) s += (ch[i] < 128) ? (char)ch[i] : '?';
     return s;
 }
 
-static bool init_gl() {
-    GLuint vs = compile_shader(GL_VERTEX_SHADER,   k_vs);
-    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, k_fs);
+static float read_hp(void* pm) {
+    if (!pm) return 0;
+    void* peh = *(void**)((uintptr_t)pm + OFF_PM_peh);
+    if ((uintptr_t)peh < 0x1000) return 0;
+    void* gun = *(void**)((uintptr_t)peh + OFF_GuB_HP);
+    if ((uintptr_t)gun < 0x1000) return 0;
+    float v = *(float*)((uintptr_t)gun + OFF_GUN_Val);
+    return (v >= 0 && v <= 1000) ? v : 0;
+}
+
+static std::string read_name(void* pm) {
+    if (!pm) return "Player";
+    void* peh = *(void**)((uintptr_t)pm + OFF_PM_peh);
+    if ((uintptr_t)peh < 0x1000) return "Player";
+    void* ns = *(void**)((uintptr_t)peh + OFF_GuB_Nm);
+    std::string n = read_str(ns);
+    return n.empty() ? "Player" : n;
+}
+
+// ── Меню состояние ────────────────────────────────────────────────────────────
+static std::atomic<bool> g_menu_vis{false};
+static bool g_esp_on    = true;
+static bool g_box_on    = true;
+static bool g_hp_on     = true;
+static bool g_name_on   = true;
+static int  g_tab       = 1; // 0=Aimbot 1=Visuals 2=Misc 3=Skins
+
+// ── Хуки PlayerManager ────────────────────────────────────────────────────────
+using fn_pm = void(*)(void*, void*);
+static fn_pm g_orig_aw = nullptr, g_orig_en = nullptr, g_orig_dis = nullptr;
+
+static void hook_Awake(void* th, void* m) {
+    if (g_orig_aw) g_orig_aw(th, m);
+    LOGI("Awake HIT this=%p", th);
+    static bool first = true;
+    if (first) { g_local = th; first = false; g_ok = true; }
+    add_player(th);
+}
+static void hook_OnEnable(void* th, void* m) {
+    if (g_orig_en) g_orig_en(th, m);
+    add_player(th);
+}
+static void hook_OnDisable(void* th, void* m) {
+    if (g_orig_dis) g_orig_dis(th, m);
+    del_player(th);
+}
+
+// ── EGL/GL рендер ─────────────────────────────────────────────────────────────
+static GLuint g_prog = 0, g_vbo = 0;
+static GLint  g_uloc_res = -1, g_uloc_col = -1;
+static GLint  g_aloc_pos = -1;
+static int    g_sw = 1080, g_sh = 1920;
+static bool   g_gl_ok = false;
+
+static const char* kVS =
+    "attribute vec2 p;\nuniform vec2 r;\n"
+    "void main(){vec2 q=p/r*2.-1.;gl_Position=vec4(q.x,-q.y,0,1);}\n";
+static const char* kFS =
+    "precision mediump float;\nuniform vec4 c;\nvoid main(){gl_FragColor=c;}\n";
+
+static bool gl_init() {
+    auto mk = [](GLenum t, const char* s) {
+        GLuint x = glCreateShader(t);
+        glShaderSource(x, 1, &s, nullptr);
+        glCompileShader(x); return x;
+    };
     g_prog = glCreateProgram();
-    glAttachShader(g_prog, vs);
-    glAttachShader(g_prog, fs);
+    glAttachShader(g_prog, mk(GL_VERTEX_SHADER, kVS));
+    glAttachShader(g_prog, mk(GL_FRAGMENT_SHADER, kFS));
     glLinkProgram(g_prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-
-    g_uloc_res   = glGetUniformLocation(g_prog, "uRes");
-    g_uloc_color = glGetUniformLocation(g_prog, "uColor");
-    g_aloc_pos   = glGetAttribLocation(g_prog,  "aPos");
-    LOGI("GL program linked, res=%d color=%d pos=%d", g_uloc_res, g_uloc_color, g_aloc_pos);
-    return true;
+    g_uloc_res = glGetUniformLocation(g_prog, "r");
+    g_uloc_col = glGetUniformLocation(g_prog, "c");
+    g_aloc_pos = glGetAttribLocation(g_prog,  "p");
+    GLint ok = 0; glGetProgramiv(g_prog, GL_LINK_STATUS, &ok);
+    LOGI("GL link=%d res=%d col=%d pos=%d", ok, g_uloc_res, g_uloc_col, g_aloc_pos);
+    return ok == GL_TRUE;
 }
 
-static void set_color(float r, float g, float b, float a) {
-    glUniform4f(g_uloc_color, r, g, b, a);
-}
-
-static void draw_verts(GLenum mode, const float* verts, int count) {
-    glVertexAttribPointer(g_aloc_pos, 2, GL_FLOAT, GL_FALSE, 0, verts);
+static void col(float r,float g,float b,float a){ glUniform4f(g_uloc_col,r,g,b,a); }
+static void quad(float x,float y,float w,float h,bool fill,float r,float g,float b,float a){
+    col(r,g,b,a);
+    float v[] = {x,y, x+w,y, x+w,y+h, x,y+h};
+    glVertexAttribPointer(g_aloc_pos,2,GL_FLOAT,GL_FALSE,0,v);
     glEnableVertexAttribArray(g_aloc_pos);
-    glDrawArrays(mode, 0, count);
+    glDrawArrays(fill?GL_TRIANGLE_FAN:GL_LINE_LOOP,0,4);
+}
+static void line(float x1,float y1,float x2,float y2,float r,float g,float b,float a){
+    col(r,g,b,a);
+    float v[]={x1,y1,x2,y2};
+    glVertexAttribPointer(g_aloc_pos,2,GL_FLOAT,GL_FALSE,0,v);
+    glEnableVertexAttribArray(g_aloc_pos);
+    glDrawArrays(GL_LINES,0,2);
 }
 
-static void draw_rect_outline(float x, float y, float w, float h,
-                               float r, float g, float b, float a, float thickness = 1.f) {
-    (void)thickness;
-    set_color(r, g, b, a);
-    float v[] = { x,y, x+w,y, x+w,y+h, x,y+h };
-    draw_verts(GL_LINE_LOOP, v, 4);
-}
-
-static void draw_rect_filled(float x, float y, float w, float h,
-                              float r, float g, float b, float a) {
-    set_color(r, g, b, a);
-    float v[] = { x,y, x+w,y, x,y+h, x+w,y+h };
-    draw_verts(GL_TRIANGLE_STRIP, v, 4);
-}
-
-static void draw_line(float x1, float y1, float x2, float y2,
-                       float r, float g, float b, float a) {
-    set_color(r, g, b, a);
-    float v[] = { x1,y1, x2,y2 };
-    draw_verts(GL_LINES, v, 2);
-}
-
-// ─── 5×7 bitmap font (ASCII 32-126) ─────────────────────────────────────────
-// Each char: 5 columns × 7 rows, packed into 5 bytes (7 bits each, LSB=top)
-static const uint8_t k_font[95][5] = {
-  {0x00,0x00,0x00,0x00,0x00}, // 32 ' '
-  {0x00,0x00,0x5f,0x00,0x00}, // 33 '!'
-  {0x00,0x07,0x00,0x07,0x00}, // 34 '"'
-  {0x14,0x7f,0x14,0x7f,0x14}, // 35 '#'
-  {0x24,0x2a,0x7f,0x2a,0x12}, // 36 '$'
-  {0x23,0x13,0x08,0x64,0x62}, // 37 '%'
-  {0x36,0x49,0x55,0x22,0x50}, // 38 '&'
-  {0x00,0x05,0x03,0x00,0x00}, // 39 '\''
-  {0x00,0x1c,0x22,0x41,0x00}, // 40 '('
-  {0x00,0x41,0x22,0x1c,0x00}, // 41 ')'
-  {0x14,0x08,0x3e,0x08,0x14}, // 42 '*'
-  {0x08,0x08,0x3e,0x08,0x08}, // 43 '+'
-  {0x00,0x50,0x30,0x00,0x00}, // 44 ','
-  {0x08,0x08,0x08,0x08,0x08}, // 45 '-'
-  {0x00,0x60,0x60,0x00,0x00}, // 46 '.'
-  {0x20,0x10,0x08,0x04,0x02}, // 47 '/'
-  {0x3e,0x51,0x49,0x45,0x3e}, // 48 '0'
-  {0x00,0x42,0x7f,0x40,0x00}, // 49 '1'
-  {0x42,0x61,0x51,0x49,0x46}, // 50 '2'
-  {0x21,0x41,0x45,0x4b,0x31}, // 51 '3'
-  {0x18,0x14,0x12,0x7f,0x10}, // 52 '4'
-  {0x27,0x45,0x45,0x45,0x39}, // 53 '5'
-  {0x3c,0x4a,0x49,0x49,0x30}, // 54 '6'
-  {0x01,0x71,0x09,0x05,0x03}, // 55 '7'
-  {0x36,0x49,0x49,0x49,0x36}, // 56 '8'
-  {0x06,0x49,0x49,0x29,0x1e}, // 57 '9'
-  {0x00,0x36,0x36,0x00,0x00}, // 58 ':'
-  {0x00,0x56,0x36,0x00,0x00}, // 59 ';'
-  {0x08,0x14,0x22,0x41,0x00}, // 60 '<'
-  {0x14,0x14,0x14,0x14,0x14}, // 61 '='
-  {0x00,0x41,0x22,0x14,0x08}, // 62 '>'
-  {0x02,0x01,0x51,0x09,0x06}, // 63 '?'
-  {0x32,0x49,0x79,0x41,0x3e}, // 64 '@'
-  {0x7e,0x11,0x11,0x11,0x7e}, // 65 'A'
-  {0x7f,0x49,0x49,0x49,0x36}, // 66 'B'
-  {0x3e,0x41,0x41,0x41,0x22}, // 67 'C'
-  {0x7f,0x41,0x41,0x22,0x1c}, // 68 'D'
-  {0x7f,0x49,0x49,0x49,0x41}, // 69 'E'
-  {0x7f,0x09,0x09,0x09,0x01}, // 70 'F'
-  {0x3e,0x41,0x49,0x49,0x7a}, // 71 'G'
-  {0x7f,0x08,0x08,0x08,0x7f}, // 72 'H'
-  {0x00,0x41,0x7f,0x41,0x00}, // 73 'I'
-  {0x20,0x40,0x41,0x3f,0x01}, // 74 'J'
-  {0x7f,0x08,0x14,0x22,0x41}, // 75 'K'
-  {0x7f,0x40,0x40,0x40,0x40}, // 76 'L'
-  {0x7f,0x02,0x0c,0x02,0x7f}, // 77 'M'
-  {0x7f,0x04,0x08,0x10,0x7f}, // 78 'N'
-  {0x3e,0x41,0x41,0x41,0x3e}, // 79 'O'
-  {0x7f,0x09,0x09,0x09,0x06}, // 80 'P'
-  {0x3e,0x41,0x51,0x21,0x5e}, // 81 'Q'
-  {0x7f,0x09,0x19,0x29,0x46}, // 82 'R'
-  {0x46,0x49,0x49,0x49,0x31}, // 83 'S'
-  {0x01,0x01,0x7f,0x01,0x01}, // 84 'T'
-  {0x3f,0x40,0x40,0x40,0x3f}, // 85 'U'
-  {0x1f,0x20,0x40,0x20,0x1f}, // 86 'V'
-  {0x3f,0x40,0x38,0x40,0x3f}, // 87 'W'
-  {0x63,0x14,0x08,0x14,0x63}, // 88 'X'
-  {0x07,0x08,0x70,0x08,0x07}, // 89 'Y'
-  {0x61,0x51,0x49,0x45,0x43}, // 90 'Z'
-  {0x00,0x7f,0x41,0x41,0x00}, // 91 '['
-  {0x02,0x04,0x08,0x10,0x20}, // 92 '\'
-  {0x00,0x41,0x41,0x7f,0x00}, // 93 ']'
-  {0x04,0x02,0x01,0x02,0x04}, // 94 '^'
-  {0x40,0x40,0x40,0x40,0x40}, // 95 '_'
-  {0x00,0x01,0x02,0x04,0x00}, // 96 '`'
-  {0x20,0x54,0x54,0x54,0x78}, // 97 'a'
-  {0x7f,0x48,0x44,0x44,0x38}, // 98 'b'
-  {0x38,0x44,0x44,0x44,0x20}, // 99 'c'
-  {0x38,0x44,0x44,0x48,0x7f}, // 100 'd'
-  {0x38,0x54,0x54,0x54,0x18}, // 101 'e'
-  {0x08,0x7e,0x09,0x01,0x02}, // 102 'f'
-  {0x0c,0x52,0x52,0x52,0x3e}, // 103 'g'
-  {0x7f,0x08,0x04,0x04,0x78}, // 104 'h'
-  {0x00,0x44,0x7d,0x40,0x00}, // 105 'i'
-  {0x20,0x40,0x44,0x3d,0x00}, // 106 'j'
-  {0x7f,0x10,0x28,0x44,0x00}, // 107 'k'
-  {0x00,0x41,0x7f,0x40,0x00}, // 108 'l'
-  {0x7c,0x04,0x18,0x04,0x78}, // 109 'm'
-  {0x7c,0x08,0x04,0x04,0x78}, // 110 'n'
-  {0x38,0x44,0x44,0x44,0x38}, // 111 'o'
-  {0x7c,0x14,0x14,0x14,0x08}, // 112 'p'
-  {0x08,0x14,0x14,0x18,0x7c}, // 113 'q'
-  {0x7c,0x08,0x04,0x04,0x08}, // 114 'r'
-  {0x48,0x54,0x54,0x54,0x20}, // 115 's'
-  {0x04,0x3f,0x44,0x40,0x20}, // 116 't'
-  {0x3c,0x40,0x40,0x20,0x7c}, // 117 'u'
-  {0x1c,0x20,0x40,0x20,0x1c}, // 118 'v'
-  {0x3c,0x40,0x30,0x40,0x3c}, // 119 'w'
-  {0x44,0x28,0x10,0x28,0x44}, // 120 'x'
-  {0x0c,0x50,0x50,0x50,0x3c}, // 121 'y'
-  {0x44,0x64,0x54,0x4c,0x44}, // 122 'z'
-  {0x00,0x08,0x36,0x41,0x00}, // 123 '{'
-  {0x00,0x00,0x7f,0x00,0x00}, // 124 '|'
-  {0x00,0x41,0x36,0x08,0x00}, // 125 '}'
-  {0x10,0x08,0x08,0x10,0x08}, // 126 '~'
+// ── 5×7 bitmap font ───────────────────────────────────────────────────────────
+static const uint8_t kFont[95][5]={
+{0,0,0,0,0},{0,0,95,0,0},{0,7,0,7,0},{20,127,20,127,20},{36,42,127,42,18},
+{35,19,8,100,98},{54,73,85,34,80},{0,5,3,0,0},{0,28,34,65,0},{0,65,34,28,0},
+{20,8,62,8,20},{8,8,62,8,8},{0,80,48,0,0},{8,8,8,8,8},{0,96,96,0,0},
+{32,16,8,4,2},{62,81,73,69,62},{0,66,127,64,0},{66,97,81,73,70},{33,65,69,75,49},
+{24,20,18,127,16},{39,69,69,69,57},{60,74,73,73,48},{1,113,9,5,3},
+{54,73,73,73,54},{6,73,73,41,30},{0,54,54,0,0},{0,86,54,0,0},{8,20,34,65,0},
+{20,20,20,20,20},{0,65,34,20,8},{2,1,81,9,6},{50,73,121,65,62},
+{126,17,17,17,126},{127,73,73,73,54},{62,65,65,65,34},{127,65,65,34,28},
+{127,73,73,73,65},{127,9,9,9,1},{62,65,73,73,122},{127,8,8,8,127},
+{0,65,127,65,0},{32,64,65,63,1},{127,8,20,34,65},{127,64,64,64,64},
+{127,2,12,2,127},{127,4,8,16,127},{62,65,65,65,62},{127,9,9,9,6},
+{62,65,81,33,94},{127,9,25,41,70},{70,73,73,73,49},{1,1,127,1,1},
+{63,64,64,64,63},{31,32,64,32,31},{63,64,56,64,63},{99,20,8,20,99},
+{7,8,112,8,7},{97,81,73,69,67},{0,127,65,65,0},{2,4,8,16,32},
+{0,65,65,127,0},{4,2,1,2,4},{64,64,64,64,64},{0,1,2,4,0},
+{32,84,84,84,120},{127,72,68,68,56},{56,68,68,68,32},{56,68,68,72,127},
+{56,84,84,84,24},{8,126,9,1,2},{12,82,82,82,62},{127,8,4,4,120},
+{0,68,125,64,0},{32,64,68,61,0},{127,16,40,68,0},{0,65,127,64,0},
+{124,4,24,4,120},{124,8,4,4,120},{56,68,68,68,56},{124,20,20,20,8},
+{8,20,20,24,124},{124,8,4,4,8},{72,84,84,84,32},{4,63,68,64,32},
+{60,64,64,32,124},{28,32,64,32,28},{60,64,48,64,60},{68,40,16,40,68},
+{12,80,80,80,60},{68,100,84,76,68},{0,8,54,65,0},{0,0,127,0,0},
+{0,65,54,8,0},{16,8,8,16,8}
 };
 
-// draw a single char at pixel position, scale=pixel size per font-pixel
-static void draw_char(char c, float px, float py, float scale,
-                       float r, float g, float b, float a) {
-    if (c < 32 || c > 126) return;
-    const uint8_t* glyph = k_font[(int)c - 32];
-    set_color(r, g, b, a);
-    for (int col = 0; col < 5; col++) {
-        uint8_t bits = glyph[col];
-        for (int row = 0; row < 7; row++) {
-            if (bits & (1 << row)) {
-                float x = px + col * scale;
-                float y = py + row * scale;
-                float v[] = { x, y, x+scale, y, x, y+scale, x+scale, y+scale };
-                draw_verts(GL_TRIANGLE_STRIP, v, 4);
+static void ch(char c,float px,float py,float sc,float r,float g,float b,float a){
+    if(c<32||c>126)return;
+    const uint8_t* gl=kFont[(int)c-32];
+    col(r,g,b,a);
+    for(int col2=0;col2<5;col2++){
+        uint8_t bits=gl[col2];
+        for(int row=0;row<7;row++){
+            if(bits&(1<<row)){
+                float x=px+col2*sc,y=py+row*sc;
+                float v[]={x,y,x+sc,y,x+sc,y+sc,x,y+sc};
+                glVertexAttribPointer(g_aloc_pos,2,GL_FLOAT,GL_FALSE,0,v);
+                glEnableVertexAttribArray(g_aloc_pos);
+                glDrawArrays(GL_TRIANGLE_FAN,0,4);
             }
         }
     }
 }
-
-static void draw_text(const char* text, float px, float py, float scale,
-                       float r, float g, float b, float a) {
-    float cx = px;
-    for (int i = 0; text[i]; i++) {
-        draw_char(text[i], cx, py, scale, r, g, b, a);
-        cx += 6.f * scale;
-    }
+static float tw(const char* s,float sc){int n=0;for(;*s;s++)n++;return n*6.f*sc;}
+static void txt(const char* s,float x,float y,float sc,float r,float g,float b,float a){
+    for(;*s;s++){ch(*s,x,y,sc,r,g,b,a);x+=6.f*sc;}
 }
 
-static float text_width(const char* text, float scale) {
-    int n = 0;
-    for (const char* p = text; *p; p++) n++;
-    return n * 6.f * scale;
+// ── Ватермарка ────────────────────────────────────────────────────────────────
+static void draw_watermark(){
+    float x=8,y=8,w=190,h=24;
+    quad(x,y,w,h,true, 0.08f,0.08f,0.08f,0.92f);
+    quad(x,y,w,h,false,0.20f,0.20f,0.20f,1.f);
+    // красный квадрат с B
+    quad(x+3,y+3,18,18,true,0.9f,0.08f,0.08f,1.f);
+    txt("B",x+6,y+5,2.f,1,1,1,1);
+    txt("BobaDLC External",x+25,y+6,1.5f,0.95f,0.95f,0.95f,1.f);
+    // индикатор меню
+    float mr=g_menu_vis?0.9f:0.4f,mg=g_menu_vis?0.1f:0.4f,mb=g_menu_vis?0.1f:0.4f;
+    txt(g_menu_vis?"[MENU ON]":"[tap here]",x+w+6,y+6,1.3f,mr,mg,mb,1.f);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ESP rendering
-// ─────────────────────────────────────────────────────────────────────────────
-static void render_esp() {
-    if (!g_menu.esp_enabled) return;
+// ── Меню ──────────────────────────────────────────────────────────────────────
+static void draw_toggle(float x,float y,bool on,const char* label){
+    float tw2=tw(label,1.4f);
+    txt(label,x,y+2,1.4f,0.85f,0.85f,0.85f,1.f);
+    float tx=x+tw2+6;
+    quad(tx,y,26,13,true,on?0.8f:0.15f,on?0.08f:0.15f,on?0.08f:0.15f,1.f);
+    quad(tx,y,26,13,false,0.3f,0.3f,0.3f,1.f);
+    float kx=on?(tx+14):(tx+1);
+    quad(kx,y+1,11,11,true,1,1,1,1.f);
+}
 
-    // Ждём 180 фреймов после инжекта
-    static int frame_delay = 0;
-    if (frame_delay < 180) { frame_delay++; return; }
+static void draw_menu(){
+    if(!g_menu_vis)return;
+    float W=(float)g_sw,H=(float)g_sh;
+    float mw=420,mh=340,mx=(W-mw)/2,my=(H-mh)/2;
 
-    std::vector<void*> players_copy;
-    void* local_copy;
-    {
-        std::lock_guard<std::mutex> lk(g_players_mutex);
-        players_copy = g_players;
-        local_copy   = g_local_pm;
-    }
-    if (players_copy.empty()) return;
+    // фон
+    quad(mx,my,mw,mh,true,0.07f,0.07f,0.07f,0.97f);
+    quad(mx,my,mw,mh,false,0.18f,0.18f,0.18f,1.f);
 
-    float W = (float)g_scr_w;
-    float H = (float)g_scr_h;
+    // заголовок
+    quad(mx,my,mw,34,true,0.11f,0.11f,0.11f,1.f);
+    quad(mx+6,my+6,22,22,true,0.9f,0.08f,0.08f,1.f);
+    txt("B",mx+9,my+8,2.3f,1,1,1,1);
+    txt("BobaDLC External",mx+34,my+9,2.f,1,1,1,1);
+    txt("by Lotusor",mx+mw-tw("by Lotusor",1.3f)-6,my+11,1.3f,0.5f,0.5f,0.5f,1);
 
-    // Рисуем 2D список игроков в правом верхнем углу (без world-to-screen)
-    float list_x = W - 200.f;
-    float list_y = 40.f;
-
-    draw_rect_filled(list_x - 4.f, list_y - 4.f, 196.f, 14.f + players_copy.size() * 20.f,
-                     0.f, 0.f, 0.f, 0.5f);
-    draw_text("PLAYERS", list_x, list_y, 1.5f, 0.9f, 0.08f, 0.08f, 1.f);
-    list_y += 14.f;
-
-    int drawn = 0;
-    for (void* pm : players_copy) {
-        if (!pm) continue;
-        if (drawn >= 10) break; // максимум 10 в списке
-
-        // Проверяем валидность объекта
-        void* klass_ptr = *(void**)pm;
-        if ((uintptr_t)klass_ptr < 0x1000) continue;
-
-        // Читаем имя
-        std::string name = "Player";
-        float hp = 0.f;
-
-        void* peh = *(void**)((uintptr_t)pm + OFF_PM_playerEventHandler);
-        if ((uintptr_t)peh > 0x1000) {
-            void* name_str = *(void**)((uintptr_t)peh + OFF_GuB_DisplayName);
-            if ((uintptr_t)name_str > 0x1000)
-                name = read_il2cpp_string(name_str);
-
-            void* health_gun = *(void**)((uintptr_t)peh + OFF_GuB_Health);
-            if ((uintptr_t)health_gun > 0x1000)
-                hp = *(float*)((uintptr_t)health_gun + OFF_GUN_float_value);
+    // табы внизу
+    float tby=my+mh-32;
+    quad(mx,tby,mw,32,true,0.1f,0.1f,0.1f,1.f);
+    line(mx,tby,mx+mw,tby,0.2f,0.2f,0.2f,1.f);
+    const char* tabs[]={"Aimbot","Visuals","Misc","Skins"};
+    float tabw=mw/4;
+    for(int i=0;i<4;i++){
+        float tx2=mx+i*tabw;
+        bool act=(g_tab==i);
+        if(act){
+            quad(tx2,tby,tabw,32,true,0.15f,0.15f,0.15f,1.f);
+            quad(tx2,tby,tabw,2,true,0.9f,0.08f,0.08f,1.f);
         }
-        if (name.empty()) name = "Player";
-        if (hp < 0.f || hp > 9999.f) hp = 0.f;
+        float lx=tx2+(tabw-tw(tabs[i],1.4f))/2;
+        txt(tabs[i],lx,tby+10,1.4f,act?1.f:0.5f,act?1.f:0.5f,act?1.f:0.5f,1.f);
+    }
 
-        // Цвет: локальный игрок синий, остальные белые
-        float cr = (pm == local_copy) ? 0.3f : 1.f;
-        float cg = (pm == local_copy) ? 0.6f : 1.f;
-        float cb = (pm == local_copy) ? 1.f  : 1.f;
+    // контент
+    float cy=my+44,cx=mx+14;
+    if(g_tab==1){
+        // VISUALS
+        txt("Visuals",cx,cy,1.6f,0.5f,0.5f,0.5f,1); cy+=22;
+        line(cx,cy,cx+mw-28,cy,0.18f,0.18f,0.18f,1); cy+=10;
+        draw_toggle(cx,cy,g_esp_on,   "ESP Enable");   cy+=22;
+        draw_toggle(cx,cy,g_box_on,   "Bounding Box"); cy+=22;
+        draw_toggle(cx,cy,g_hp_on,    "Health Bar");   cy+=22;
+        draw_toggle(cx,cy,g_name_on,  "Name + HP");    cy+=22;
+        char pb[32]; snprintf(pb,sizeof(pb),"Players: %zu",(size_t)g_players.size());
+        txt(pb,cx,cy+4,1.4f,0.6f,0.6f,0.6f,1);
+    } else if(g_tab==0){
+        txt("Aimbot",cx,cy,1.6f,0.5f,0.5f,0.5f,1); cy+=22;
+        line(cx,cy,cx+mw-28,cy,0.18f,0.18f,0.18f,1); cy+=10;
+        txt("Coming soon",cx,cy,1.5f,0.4f,0.4f,0.4f,1);
+    } else if(g_tab==2){
+        txt("Misc",cx,cy,1.6f,0.5f,0.5f,0.5f,1); cy+=22;
+        line(cx,cy,cx+mw-28,cy,0.18f,0.18f,0.18f,1); cy+=10;
+        txt("Coming soon",cx,cy,1.5f,0.4f,0.4f,0.4f,1);
+    } else {
+        txt("Skins",cx,cy,1.6f,0.5f,0.5f,0.5f,1); cy+=22;
+        line(cx,cy,cx+mw-28,cy,0.18f,0.18f,0.18f,1); cy+=10;
+        txt("Coming soon",cx,cy,1.5f,0.4f,0.4f,0.4f,1);
+    }
+}
+
+// ── ESP (2D список) ───────────────────────────────────────────────────────────
+static void draw_esp(){
+    if(!g_esp_on||!g_ok)return;
+    static int delay=0; if(delay<180){delay++;return;}
+
+    std::vector<void*> snap;
+    void* loc;
+    {std::lock_guard<std::mutex> lk(g_mtx); snap=g_players; loc=g_local;}
+    if(snap.empty())return;
+
+    float lx=(float)g_sw-210.f, ly=40.f;
+    quad(lx-4,ly-4,206,14+(float)snap.size()*22,true,0,0,0,0.55f);
+    txt("PLAYERS",lx,ly,1.5f,0.9f,0.1f,0.1f,1); ly+=16;
+
+    int n=0;
+    for(void* pm:snap){
+        if(n>=12)break;
+        if(!pm||(uintptr_t)pm<0x1000)continue;
+        void* kp=*(void**)pm; if((uintptr_t)kp<0x1000)continue;
+
+        float hp=read_hp(pm);
+        std::string nm=read_name(pm);
+        bool is_loc=(pm==loc);
+
+        // полоска hp
+        if(g_hp_on){
+            float bw=200*(hp/100.f);
+            if(bw<0)bw=0; if(bw>200)bw=200;
+            quad(lx,ly,200,3,true,0.2f,0,0,0.8f);
+            float gr=1-(hp/100.f),gg=hp/100.f;
+            quad(lx,ly,bw,3,true,gr,gg,0,0.9f);
+        }
 
         char buf[64];
-        snprintf(buf, sizeof(buf), "%s  %.0fhp", name.c_str(), hp);
+        if(g_name_on) snprintf(buf,sizeof(buf),"%s %.0fhp",nm.c_str(),hp);
+        else          snprintf(buf,sizeof(buf),"%.0fhp",hp);
 
-        // Полоска здоровья
-        float bar_w = 190.f * std::max(0.f, std::min(1.f, hp / 100.f));
-        draw_rect_filled(list_x - 2.f, list_y, 190.f, 2.f, 0.3f, 0.f, 0.f, 0.8f);
-        draw_rect_filled(list_x - 2.f, list_y, bar_w,  2.f, 0.f,  0.8f, 0.2f, 0.9f);
-
-        draw_text(buf, list_x, list_y + 3.f, 1.4f, cr, cg, cb, 1.f);
-        list_y += 20.f;
-        drawn++;
+        float cr=is_loc?0.3f:1, cg=is_loc?0.7f:1, cb=is_loc?1.f:1;
+        txt(buf,lx,ly+5,1.4f,cr,cg,cb,1);
+        ly+=22; n++;
     }
 }
 
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Menu rendering  (BobaDLC External dark+red style)
-// Colors: bg=#141414, panel=#1c1c1c, accent=#e53935, text=#ffffff, sub=#9e9e9e
-// ─────────────────────────────────────────────────────────────────────────────
-static void render_toggle(float x, float y, float w, float h, bool on,
-                           const char* label) {
-    // track bg
-    draw_rect_filled(x, y, w, h, 0.13f,0.13f,0.13f, 1.f);
-    draw_rect_outline(x, y, w, h, 0.25f,0.25f,0.25f, 1.f);
-    // knob
-    float kw = h * 0.9f;
-    float kx = on ? (x + w - kw - 1.f) : (x + 1.f);
-    float ky = y + (h - kw) * 0.5f;
-    if (on) {
-        draw_rect_filled(x, y, w, h, 0.9f,0.08f,0.08f, 1.f);
-    }
-    draw_rect_filled(kx, ky, kw, kw, 1.f,1.f,1.f, 1.f);
-    // label
-    draw_text(label, x - text_width(label, 1.5f) - 4.f, y + (h - 7*1.5f)*0.5f,
-              1.5f, 1.f,1.f,1.f, 1.f);
-}
-
-static void render_menu() {
-    if (!g_menu.visible) return;
-
-    float W = (float)g_scr_w;
-    float H = (float)g_scr_h;
-
-    // center the menu
-    float mw = 480.f, mh = 380.f;
-    float mx = (W - mw) * 0.5f, my = (H - mh) * 0.5f;
-
-    // ── main background ───────────────────────────────────────────────────────
-    draw_rect_filled(mx, my, mw, mh, 0.078f, 0.078f, 0.078f, 0.97f);
-    draw_rect_outline(mx, my, mw, mh, 0.15f, 0.15f, 0.15f, 1.f);
-
-    // ── title bar ─────────────────────────────────────────────────────────────
-    float th = 36.f;
-    draw_rect_filled(mx, my, mw, th, 0.11f, 0.11f, 0.11f, 1.f);
-    // 'Z' logo box (red)
-    draw_rect_filled(mx + 8.f, my + 6.f, 24.f, 24.f, 0.9f, 0.08f, 0.08f, 1.f);
-    draw_text("B", mx + 12.f, my + 11.f, 2.5f, 1.f, 1.f, 1.f, 1.f);
-    draw_text("BobaDLC External", mx + 40.f, my + 11.f, 2.2f, 1.f, 1.f, 1.f, 1.f);
-    // watermark text right side
-    draw_text("bobadlc", mx + mw - text_width("bobadlc", 1.5f) - 8.f, my + 12.f,
-              1.5f, 0.6f, 0.6f, 0.6f, 1.f);
-
-    // ── tab bar ───────────────────────────────────────────────────────────────
-    float tby = my + mh - 36.f;
-    draw_rect_filled(mx, tby, mw, 36.f, 0.1f, 0.1f, 0.1f, 1.f);
-    draw_line(mx, tby, mx+mw, tby, 0.18f, 0.18f, 0.18f, 1.f);
-
-    const char* tabs[] = { "Aimbot", "Visuals", "Misc", "Skins" };
-    float tab_w = mw / 4.f;
-    for (int i = 0; i < 4; i++) {
-        float tx = mx + i * tab_w;
-        bool active = (g_menu.active_tab == i);
-        if (active) {
-            draw_rect_filled(tx, tby, tab_w, 36.f, 0.14f, 0.14f, 0.14f, 1.f);
-            draw_rect_filled(tx, tby, tab_w, 2.f, 0.9f, 0.08f, 0.08f, 1.f);
-        }
-        float label_x = tx + (tab_w - text_width(tabs[i], 1.5f)) * 0.5f;
-        float cr = active ? 1.f : 0.55f;
-        float cg = active ? 1.f : 0.55f;
-        float cb = active ? 1.f : 0.55f;
-        draw_text(tabs[i], label_x, tby + 12.f, 1.5f, cr, cg, cb, 1.f);
-    }
-
-    // ── content area ─────────────────────────────────────────────────────────
-    float cy = my + th + 12.f;
-    float cx = mx + 12.f;
-    float pw = (mw - 36.f) * 0.5f;  // two-column layout
-
-    if (g_menu.active_tab == 0) {
-        // ── AIMBOT ────────────────────────────────────────────────────────────
-        draw_text("Enable",    cx + pw - text_width("Enable", 1.5f) - 36.f, cy,     1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.aimbot_enabled, "");
-        cy += 24.f;
-        draw_text("Silent",    cx + pw - text_width("Silent", 1.5f) - 36.f, cy,     1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.aimbot_silent, "");
-        cy += 28.f;
-
-        // divider
-        draw_line(cx, cy, cx + (mw - 24.f), cy, 0.2f,0.2f,0.2f, 1.f);
-        cy += 10.f;
-        draw_text("Target", cx, cy, 1.5f, 0.5f,0.5f,0.5f, 1.f);
-        cy += 20.f;
-        draw_text("Bones Group",  cx, cy, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        draw_text("Head",  cx + pw - text_width("Head",1.5f), cy, 1.5f, 0.9f,0.08f,0.08f, 1.f);
-        cy += 20.f;
-        draw_text("Visible Check", cx, cy, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.aimbot_vis_only, "");
-
-    } else if (g_menu.active_tab == 1) {
-        // ── VISUALS ───────────────────────────────────────────────────────────
-        draw_text("Enable", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_enabled, "");
-        cy += 24.f;
-
-        draw_text("Bounding Box", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_box, "");
-        cy += 24.f;
-
-        draw_text("Health Bar", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_health, "");
-        cy += 24.f;
-
-        draw_text("Name + HP",  cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.esp_name, "");
-        cy += 28.f;
-
-        draw_line(cx, cy, cx + (mw - 24.f), cy, 0.2f,0.2f,0.2f, 1.f);
-        cy += 10.f;
-
-        // ESP preview label (right column)
-        draw_text("ESP Preview", cx + pw + 12.f, my + th + 12.f, 1.5f, 0.5f,0.5f,0.5f, 1.f);
-        // small player silhouette
-        float px2 = cx + pw + 60.f, py2 = my + th + 32.f;
-        draw_rect_outline(px2, py2, 50.f, 120.f, 0.9f,0.08f,0.08f, 1.f);
-        draw_rect_filled(px2 - 5.f, py2, 3.f, 120.f*0.7f, 0.9f, 0.4f, 0.1f, 0.8f);
-
-    } else if (g_menu.active_tab == 2) {
-        // ── MISC ──────────────────────────────────────────────────────────────
-        draw_text("No Recoil", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        render_toggle(cx + pw - 32.f, cy - 2.f, 28.f, 14.f, g_menu.no_recoil, "");
-        cy += 24.f;
-
-        draw_text("Max ESP Dist", cx, cy + 3.f, 1.5f, 0.8f,0.8f,0.8f, 1.f);
-        char dbuf[16]; snprintf(dbuf, sizeof(dbuf), "%.0fm", g_menu.esp_max_dist);
-        draw_text(dbuf, cx + pw - text_width(dbuf, 1.5f), cy + 3.f, 1.5f, 0.9f,0.08f,0.08f, 1.f);
-        cy += 24.f;
-
-    } else if (g_menu.active_tab == 3) {
-        // ── SKINS ─────────────────────────────────────────────────────────────
-        draw_text("Coming soon", cx + (pw - text_width("Coming soon",2.f))*0.5f,
-                  my + mh*0.5f - 10.f, 2.f, 0.5f,0.5f,0.5f, 1.f);
-    }
-
-    // ── watermark overlay (top-left corner) ───────────────────────────────────
-    // Handled separately below (always visible)
-}
-
-// ─── permanent watermark (top bar, always on screen) ─────────────────────────
-static void render_watermark() {
-    float bw = 180.f, bh = 22.f, bx = 8.f, by = 8.f;
-    draw_rect_filled(bx, by, bw, bh, 0.08f, 0.08f, 0.08f, 0.85f);
-    draw_rect_outline(bx, by, bw, bh, 0.18f, 0.18f, 0.18f, 1.f);
-    // red 'Z'
-    draw_rect_filled(bx + 3.f, by + 3.f, 16.f, 16.f, 0.9f, 0.08f, 0.08f, 1.f);
-    draw_text("B", bx + 5.5f, by + 5.f, 2.f, 1.f, 1.f, 1.f, 1.f);
-    draw_text("BobaDLC External", bx + 22.f, by + 6.f, 1.5f, 0.9f, 0.9f, 0.9f, 1.f);
-    // version
-    draw_text("1.0", bx + bw - text_width("1.0", 1.2f) - 5.f, by + 7.f, 1.2f, 0.5f,0.5f,0.5f, 1.f);
-
-    // menu toggle hint
-    // подсказка — тапни по ватермарке чтобы открыть меню
-    draw_text("[tap to open]", bx + bw + 5.f, by + 6.f, 1.2f,
-              g_menu.visible ? 0.9f : 0.45f,
-              g_menu.visible ? 0.1f : 0.45f,
-              g_menu.visible ? 0.1f : 0.45f, 0.9f);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Touch input reader — читаем /dev/input/eventX напрямую в отдельном треде.
-// Тап по ватермарке (левый верхний угол, 8..188 x 8..30 в экранных пикселях)
-// переключает меню. Работает независимо от Unity input system.
-// ─────────────────────────────────────────────────────────────────────────────
-#include <linux/input.h>
-#include <dirent.h>
-#include <fcntl.h>
-
-// Зона ватермарки в нормализованных координатах (0..1).
-// Физически: bx=8 bw=180 by=8 bh=22 на любом разрешении.
-// Берём с запасом чтобы было удобно тапать пальцем.
-static constexpr float kWM_X0 = 0.f,   kWM_X1 = 0.22f;
-static constexpr float kWM_Y0 = 0.f,   kWM_Y1 = 0.06f;
-
-// Последняя позиция касания (в ABS единицах устройства, конвертируем позже)
-struct TouchSlot {
-    int x = 0, y = 0;
-    bool down = false;
-};
-
-static std::atomic<bool> g_touch_menu_toggle{false}; // сигнал из тред → рендер
-
-// Найти все /dev/input/eventX которые репортят ABS_MT_POSITION
-static std::vector<std::string> find_touch_devices() {
-    // Сначала пробуем найти через /proc/bus/input/devices — более надёжно
-    std::vector<std::string> result;
-    // Пробуем все event0..event9 напрямую
-    for (int i = 0; i < 15; i++) {
-        char path[32];
-        snprintf(path, sizeof(path), "/dev/input/event%d", i);
-        int fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (fd < 0) continue;
-        uint8_t evbits[EV_MAX / 8 + 1] = {};
-        if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) >= 0) {
-            bool has_abs = (evbits[EV_ABS / 8] & (1 << (EV_ABS % 8))) != 0;
-            if (has_abs) {
-                uint8_t absbits[ABS_MAX / 8 + 1] = {};
-                ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
-                bool has_mt = (absbits[ABS_MT_POSITION_X / 8] & (1 << (ABS_MT_POSITION_X % 8))) != 0;
-                bool has_abs_x = (absbits[ABS_X / 8] & (1 << (ABS_X % 8))) != 0;
-                if (has_mt || has_abs_x) {
-                    result.push_back(std::string(path));
-                    LOGI("touch device found: %s", path);
-                }
-            }
-        }
-        close(fd);
-    }
-    return result;
-}
-// _REPLACED_OLD_FIND_
-
-static void touch_reader_thread() {
-    // ждём пока игра поднимется
-    sleep(8);
-
-    auto devices = find_touch_devices();
-    if (devices.empty()) {
-        LOGE("no touch devices found — меню через /data/local/tmp/.bobadlc_menu");
-        // Fallback: файловый триггер если /dev/input недоступен
-        while (true) {
-            struct stat st{};
-            bool file_exists = (stat("/data/local/tmp/.bobadlc_menu", &st) == 0);
-            if (file_exists) g_touch_menu_toggle.store(true);
-            sleep(1);
-        }
-        return;
-    }
-
-    // берём первое найденное тач-устройство
-    const std::string& dev = devices[0];
-    int fd = open(dev.c_str(), O_RDONLY);
-    if (fd < 0) { LOGE("can't open %s", dev.c_str()); return; }
-
-    // получить диапазоны ABS_MT_POSITION_X/Y чтобы нормализовать
-    struct input_absinfo abs_x{}, abs_y{};
-    ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_x);
-    ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_y);
-    float max_x = (abs_x.maximum > 0) ? (float)abs_x.maximum : 1080.f;
-    float max_y = (abs_y.maximum > 0) ? (float)abs_y.maximum : 1920.f;
-    LOGI("touch range: x=0..%.0f y=0..%.0f", max_x, max_y);
-
-    TouchSlot slot{};
-    bool was_down = false;
-    float touch_norm_x = 0.f, touch_norm_y = 0.f;
-
-    struct input_event ev{};
-    while (true) {
-        ssize_t n = read(fd, &ev, sizeof(ev));
-        if (n < (ssize_t)sizeof(ev)) { usleep(5000); continue; }
-
-        if (ev.type == EV_ABS) {
-            if (ev.code == ABS_MT_POSITION_X || ev.code == ABS_X)
-                slot.x = ev.value;
-            else if (ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y)
-                slot.y = ev.value;
-            else if (ev.code == ABS_MT_TRACKING_ID)
-                slot.down = (ev.value != -1);
-        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
-            slot.down = (ev.value == 1);
-        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            // палец поднялся — проверяем был ли тап по ватермарке
-            if (was_down && !slot.down) {
-                float nx = (float)slot.x / max_x;
-                float ny = (float)slot.y / max_y;
-                if (nx >= kWM_X0 && nx <= kWM_X1 &&
-                    ny >= kWM_Y0 && ny <= kWM_Y1) {
-                    g_touch_menu_toggle.store(true);
-                    LOGI("watermark tapped! nx=%.3f ny=%.3f", nx, ny);
-                }
-            }
-            was_down = slot.down;
-        }
-    }
-    close(fd);
-}
-
-// check_menu_toggle вызывается из рендер-треда (eglSwapBuffers)
-static void check_menu_toggle() {
-    if (g_touch_menu_toggle.exchange(false)) {
-        g_menu.visible = !g_menu.visible;
-        LOGI("menu toggled -> %s", g_menu.visible ? "open" : "closed");
+// ── Меню тогл через файл ──────────────────────────────────────────────────────
+static void check_toggle(){
+    static int t=0; if(++t<30)return; t=0;
+    struct stat st{};
+    bool ex=(stat("/data/local/tmp/.bobadlc_menu",&st)==0);
+    if(ex!=g_menu_vis.load()) {
+        g_menu_vis=ex;
+        LOGI("menu %s",ex?"OPEN":"CLOSED");
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// eglSwapBuffers hook
-// ─────────────────────────────────────────────────────────────────────────────
-using fn_eglSwap = EGLBoolean(*)(EGLDisplay, EGLSurface);
-using fn_vkPresent = VkResult(*)(VkQueue, const VkPresentInfoKHR*);
-static fn_vkPresent g_orig_vkPresent = nullptr;
-static bool g_using_vulkan = false;
-static fn_eglSwap g_orig_swap = nullptr;
+// ── EGL hook ──────────────────────────────────────────────────────────────────
+using fn_swap=EGLBoolean(*)(EGLDisplay,EGLSurface);
+static fn_swap g_orig_swap=nullptr;
+static int g_frame=0;
 
-static VkResult hooked_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
-    static int vk_frame = 0;
-    vk_frame++;
+static EGLBoolean hook_swap(EGLDisplay dpy,EGLSurface surf){
+    g_frame++;
 
-    if (vk_frame == 1) LOGI("Vulkan present hook firing!");
+    if(g_frame==1) LOGI("eglSwapBuffers FIRING frame=1");
+    if(g_frame%300==0) LOGI("frame=%d gl=%d",g_frame,(int)g_gl_ok);
 
-    if (vk_frame >= 60) {
-        if (!g_gl_ready) {
-            // Vulkan path: нет OpenGL, используем Canvas overlay через /proc
-            // Просто логируем пока что
-            if (vk_frame == 60) LOGI("Vulkan renderer detected — GL ESP not available");
-            g_gl_ready = false; // останется false
-        }
-        if (vk_frame % 300 == 0) LOGI("vk_frame=%d players=%zu", vk_frame, g_players.size());
+    if(g_frame>60 && !g_gl_ok){
+        EGLint w=0,h=0;
+        eglQuerySurface(dpy,surf,EGL_WIDTH,&w);
+        eglQuerySurface(dpy,surf,EGL_HEIGHT,&h);
+        if(w>100&&h>100){g_sw=w;g_sh=h;}
+        if(gl_init()) g_gl_ok=true;
+        LOGI("GL init screen=%dx%d ok=%d",g_sw,g_sh,(int)g_gl_ok);
     }
 
-    return g_orig_vkPresent(queue, pPresentInfo);
+    if(g_gl_ok){
+        glUseProgram(g_prog);
+        glUniform2f(g_uloc_res,(float)g_sw,(float)g_sh);
+        GLboolean ob,od;
+        glGetBooleanv(GL_BLEND,&ob);
+        glGetBooleanv(GL_DEPTH_TEST,&od);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_DEPTH_TEST);
+        draw_watermark();
+        check_toggle();
+        draw_menu();
+        draw_esp();
+        if(!ob)glDisable(GL_BLEND);
+        if(od)glEnable(GL_DEPTH_TEST);
+        glUseProgram(0);
+        if(g_aloc_pos>=0)glDisableVertexAttribArray((GLuint)g_aloc_pos);
+    }
+
+    return g_orig_swap(dpy,surf);
 }
 
-static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    // Инициализируем GL один раз с задержкой
-    static int frame_cnt = 0;
-    frame_cnt++;
+// ── Установка хуков ───────────────────────────────────────────────────────────
+static void install(){
+    // PlayerManager хуки
+    A64HookFunction(rva(RVA_PM_Awake),    (void*)hook_Awake,     (void**)&g_orig_aw);
+    A64HookFunction(rva(RVA_PM_OnEnable), (void*)hook_OnEnable,  (void**)&g_orig_en);
+    A64HookFunction(rva(RVA_PM_OnDis),    (void*)hook_OnDisable, (void**)&g_orig_dis);
+    LOGI("PlayerManager hooks done");
 
-    // Первые 60 фреймов — только вызываем оригинал
-    if (frame_cnt < 60) return g_orig_swap(dpy, surf);
-    if (frame_cnt % 60 == 0) LOGI("frame=%d gl_ready=%d injected=%d", frame_cnt, (int)g_gl_ready, (int)g_injected.load());
+    // Хукаем eglSwapBuffers из ВСЕХ загруженных либ
+    // Сначала системный libEGL.so
+    auto hook_egl_from = [](const char* libname) -> bool {
+        void* h = dlopen(libname, RTLD_LAZY|RTLD_NOLOAD);
+        if(!h) h = dlopen(libname, RTLD_LAZY);
+        if(!h) return false;
+        void* fn = dlsym(h, "eglSwapBuffers");
+        if(!fn) return false;
+        bool ok = A64HookFunction(fn, (void*)hook_swap, (void**)&g_orig_swap);
+        LOGI("eglSwapBuffers from %s: %s fn=%p", libname, ok?"OK":"FAIL", fn);
+        return ok;
+    };
 
-    // Инициализируем GL программу один раз
-    if (!g_gl_ready) {
-        // Читаем размер через EGL
-        EGLint w = 0, h = 0;
-        eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
-        eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-        if (w > 100 && h > 100) {
-            g_scr_w = w; g_scr_h = h;
-            LOGI("screen: %dx%d", g_scr_w, g_scr_h);
-            if (init_gl()) {
-                g_gl_ready = true;
-                LOGI("GL ready");
-            }
-        }
-        return g_orig_swap(dpy, surf);
-    }
+    // Пробуем все варианты
+    bool egl_hooked = false;
+    egl_hooked |= hook_egl_from("libEGL.so");
 
-    // Рендер
-    glUseProgram(g_prog);
-    glUniform2f(g_uloc_res, (float)g_scr_w, (float)g_scr_h);
-
-    GLboolean old_blend, old_depth;
-    glGetBooleanv(GL_BLEND,      &old_blend);
-    glGetBooleanv(GL_DEPTH_TEST, &old_depth);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_DEPTH_TEST);
-
-    render_watermark();
-    check_menu_toggle();
-    render_menu();
-    render_esp();
-
-    if (!old_blend) glDisable(GL_BLEND);
-    if (old_depth)  glEnable(GL_DEPTH_TEST);
-    glUseProgram(0);
-    if (g_aloc_pos >= 0) glDisableVertexAttribArray((GLuint)g_aloc_pos);
-
-    return g_orig_swap(dpy, surf);
-}
-
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PlayerManager hooks
-// ─────────────────────────────────────────────────────────────────────────────
-using fn_pm_void = void(*)(void* __this, void* method);
-
-static fn_pm_void g_orig_awake     = nullptr;
-static fn_pm_void g_orig_on_enable = nullptr;
-static fn_pm_void g_orig_on_disable = nullptr;
-
-static void hooked_Awake(void* __this, void* method) {
-    // Вызываем оригинал ПЕРВЫМ — Unity должна инициализировать компонент
-    if (g_orig_awake) g_orig_awake(__this, method);
-
-    LOGI("Awake HIT! this=%p", __this);
-
-    // Только сохраняем указатель — никаких чтений полей здесь
-    // Поля читаем позже в render thread когда всё инициализировано
-    static bool first = true;
-    if (first) {
-        g_local_pm = __this;
-        first = false;
-        g_injected.store(true);
-        init_camera_fns();
-        LOGI("local player set to %p, camera fns init done", __this);
-    }
-    add_player(__this);
-}
-
-
-static void hooked_OnEnable(void* __this, void* method) {
-    if (g_orig_on_enable) g_orig_on_enable(__this, method);
-    add_player(__this);
-}
-
-static void hooked_OnDisable(void* __this, void* method) {
-    if (g_orig_on_disable) g_orig_on_disable(__this, method);
-    remove_player(__this);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Hook installation
-// ─────────────────────────────────────────────────────────────────────────────
-static void install_hooks() {
-    // PlayerManager hooks
-    do_hook(RVA_PM_Awake,     (void*)hooked_Awake,      (void**)&g_orig_awake);
-    do_hook(RVA_PM_OnEnable,  (void*)hooked_OnEnable,   (void**)&g_orig_on_enable);
-    do_hook(RVA_PM_OnDisable, (void*)hooked_OnDisable,  (void**)&g_orig_on_disable);
-
-    // eglSwapBuffers hook — the render thread is Unity's own, safe for IL2CPP calls
-    void* egl_lib = dlopen("libEGL.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!egl_lib) egl_lib = dlopen("libEGL.so", RTLD_LAZY);
-    if (egl_lib) {
-        void* swap_fn = dlsym(egl_lib, "eglSwapBuffers");
-        if (swap_fn) {
-            bool ok = A64HookFunction(swap_fn, (void*)hooked_eglSwapBuffers, (void**)&g_orig_swap);
-            LOGI("eglSwapBuffers hook: %s  orig=%p", ok ? "OK" : "FAIL", g_orig_swap);
-        } else {
-            LOGE("eglSwapBuffers not found in libEGL.so");
-        }
-    } else {
-        LOGE("libEGL.so dlopen failed");
-    }
-
-    // Vulkan через libunity.so — Unity грузит Vulkan сам, не через системный libvulkan
-    // Ищем vkQueuePresentKHR внутри libunity.so
-    void* unity_lib = dlopen("libunity.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (unity_lib) {
-        void* vk_fn = dlsym(unity_lib, "vkQueuePresentKHR");
-        if (vk_fn) {
-            bool ok = A64HookFunction(vk_fn, (void*)hooked_vkQueuePresentKHR, (void**)&g_orig_vkPresent);
-            LOGI("libunity.so vkQueuePresentKHR hook: %s", ok ? "OK" : "FAIL");
-            if (ok) g_using_vulkan = true;
-        } else {
-            LOGI("vkQueuePresentKHR not exported from libunity.so — scanning maps");
-        }
-    } else {
-        LOGI("libunity.so not found via dlopen");
-    }
-
-    // Если Vulkan не нашли — ищем eglSwapBuffers в libunity.so
-    if (!g_using_vulkan && unity_lib) {
-        void* egl_fn = dlsym(unity_lib, "eglSwapBuffers");
-        if (egl_fn) {
-            bool ok = A64HookFunction(egl_fn, (void*)hooked_eglSwapBuffers, (void**)&g_orig_swap);
-            LOGI("libunity.so eglSwapBuffers hook: %s", ok ? "OK" : "FAIL");
-        }
-    }
-
-    LOGI("all hooks installed (vulkan=%d)", (int)g_using_vulkan);
-
-    // Логируем какие render-библиотеки загружены — для диагностики
+    // Ищем libunity.so по полному пути
+    std::string unity_path;
     {
         std::ifstream maps("/proc/self/maps");
         std::string line;
-        bool found_egl = false, found_vk = false, found_unity = false;
-        while (std::getline(maps, line)) {
-            if (line.find("libEGL") != std::string::npos && !found_egl) {
-                LOGI("render lib: %s", line.c_str()); found_egl = true;
-            }
-            if (line.find("libvulkan") != std::string::npos && !found_vk) {
-                LOGI("render lib: %s", line.c_str()); found_vk = true;
-            }
-            if (line.find("libunity") != std::string::npos && !found_unity) {
-                LOGI("unity lib: %s", line.c_str()); found_unity = true;
+        while(std::getline(maps,line)){
+            if(line.find("libunity.so")==std::string::npos) continue;
+            auto sl=line.find('/');
+            if(sl==std::string::npos) continue;
+            unity_path=line.substr(sl);
+            while(!unity_path.empty()&&(unity_path.back()=='\n'||unity_path.back()==' '))
+                unity_path.pop_back();
+            break;
+        }
+    }
+    LOGI("libunity path: %s", unity_path.c_str());
+
+    if(!unity_path.empty()){
+        void* uh = dlopen(unity_path.c_str(), RTLD_LAZY|RTLD_GLOBAL);
+        LOGI("libunity dlopen: %s", uh?"OK":dlerror());
+        if(uh){
+            void* fn = dlsym(uh,"eglSwapBuffers");
+            LOGI("libunity eglSwapBuffers: %p", fn);
+            if(fn && !egl_hooked){
+                bool ok=A64HookFunction(fn,(void*)hook_swap,(void**)&g_orig_swap);
+                LOGI("libunity eglSwap hook: %s",ok?"OK":"FAIL");
+                egl_hooked|=ok;
             }
         }
     }
 
-    // запускаем тред чтения тачскрина
-    std::thread(touch_reader_thread).detach();
+    LOGI("all hooks done. egl_hooked=%d",(int)egl_hooked);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Zygisk module
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Zygisk ────────────────────────────────────────────────────────────────────
 class LotusorModule : public zygisk::ModuleBase {
-    zygisk::Api* api_ = nullptr;
-    JNIEnv*      env_ = nullptr;
-    bool         target_ = false;
+    zygisk::Api* api_=nullptr;
+    JNIEnv* env_=nullptr;
+    bool target_=false;
 public:
-    void onLoad(zygisk::Api* api, JNIEnv* env) override {
-        api_ = api; env_ = env;
+    void onLoad(zygisk::Api* a,JNIEnv* e)override{api_=a;env_=e;}
+
+    void preAppSpecialize(zygisk::AppSpecializeArgs* args)override{
+        if(!args||!args->nice_name){
+            api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);return;
+        }
+        const char* pkg=env_->GetStringUTFChars(args->nice_name,nullptr);
+        if(pkg){
+            if(strstr(pkg,"com.catsbit.oxidesurvivalisland")||strstr(pkg,"catsbit"))
+                target_=true;
+            env_->ReleaseStringUTFChars(args->nice_name,pkg);
+        }
+        if(!target_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
-    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
-        if (!args || !args->nice_name) {
-            api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-        const char* pkg = env_->GetStringUTFChars(args->nice_name, nullptr);
-        if (pkg) {
-            // Oxide Survival by Catsbit
-            if (strstr(pkg, "com.catsbit.oxidesurvivalisland") || strstr(pkg, "catsbit"))
-                target_ = true;
-            env_->ReleaseStringUTFChars(args->nice_name, pkg);
-        }
-        if (!target_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-    }
-
-    void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
-        if (!target_) return;
-
-        // Find libil2cpp base — it may not be loaded yet at this point.
-        // Spin in a detached thread until it appears.
-        std::thread([]() {
+    void postAppSpecialize(const zygisk::AppSpecializeArgs*)override{
+        if(!target_)return;
+        std::thread([](){
             LOGI("waiting for libil2cpp.so...");
-            for (int i = 0; i < 600; i++) {
-                uintptr_t base = find_lib_base("libil2cpp.so");
-                if (base) {
-                    g_il2cpp_base = base;
-                    LOGI("libil2cpp.so base: 0x%lx", base);
-                    // small extra delay so the lib fully initializes before we hook
+            for(int i=0;i<600;i++){
+                uintptr_t base=find_base("libil2cpp.so");
+                if(base){
+                    g_base=base;
+                    LOGI("libil2cpp base=0x%lx",base);
                     sleep(2);
-                    install_hooks();
+                    install();
                     return;
                 }
-                usleep(200000); // 200ms
+                usleep(200000);
             }
-            LOGE("libil2cpp.so never appeared");
+            LOGE("libil2cpp not found");
         }).detach();
     }
 };
 
 REGISTER_ZYGISK_MODULE(LotusorModule)
-
-extern "C" __attribute__((visibility("default"))) int zygisk_module_abi_version() { return 4; }
+extern "C" __attribute__((visibility("default"))) int zygisk_module_abi_version(){return 4;}
