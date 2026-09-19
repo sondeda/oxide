@@ -541,51 +541,45 @@ static void install(){
         // (некоторые Unity версии используют его для swap)
     }
 
-    // 3. Хукаем через GOT libunity.so если прямой экспорт не нашёлся
-    // GOT-патчинг: находим PLT entry для eglSwapBuffers внутри libunity.so
-    if(!egl_hooked && unity_base) {
-        // Ищем паттерн вызова eglSwapBuffers в .got.plt секции libunity.so
-        auto* ehdr = (Elf64_Ehdr*)unity_base;
-        auto* shdr = (Elf64_Shdr*)(unity_base + ehdr->e_shoff);
-        // e_shoff может быть 0 в stripped lib — используем dynamic approach
-        // Ищем .rela.plt
+    // 3. GOT патч libunity.so — Unity вызывает eglSwapBuffers через свой GOT
+    if(unity_base) {
         uintptr_t load_bias = 0;
-        auto* phdr = (Elf64_Phdr*)(unity_base + ehdr->e_phoff);
-        for(int i=0;i<ehdr->e_phnum;i++){
-            if(phdr[i].p_type==PT_LOAD&&phdr[i].p_offset==0){
-                load_bias=unity_base-phdr[i].p_vaddr; break;
+        auto* ehdr2 = (Elf64_Ehdr*)unity_base;
+        auto* phdr2 = (Elf64_Phdr*)(unity_base + ehdr2->e_phoff);
+        for(int i=0;i<ehdr2->e_phnum;i++){
+            if(phdr2[i].p_type==PT_LOAD&&phdr2[i].p_offset==0){
+                load_bias=unity_base-phdr2[i].p_vaddr; break;
             }
         }
-        Elf64_Dyn* dyn=nullptr;
-        for(int i=0;i<ehdr->e_phnum;i++){
-            if(phdr[i].p_type==PT_DYNAMIC){
-                dyn=(Elf64_Dyn*)(load_bias+phdr[i].p_vaddr); break;
+        Elf64_Dyn* dyn2=nullptr;
+        for(int i=0;i<ehdr2->e_phnum;i++){
+            if(phdr2[i].p_type==PT_DYNAMIC){
+                dyn2=(Elf64_Dyn*)(load_bias+phdr2[i].p_vaddr); break;
             }
         }
-        if(dyn){
-            Elf64_Rela* rela_plt=nullptr; size_t rela_plt_sz=0;
-            Elf64_Sym* symtab=nullptr; const char* strtab=nullptr;
-            for(auto* d=dyn;d->d_tag!=DT_NULL;d++){
-                if(d->d_tag==DT_JMPREL) rela_plt=(Elf64_Rela*)(load_bias+d->d_un.d_ptr);
-                if(d->d_tag==DT_PLTRELSZ) rela_plt_sz=d->d_un.d_val/sizeof(Elf64_Rela);
-                if(d->d_tag==DT_SYMTAB) symtab=(Elf64_Sym*)(load_bias+d->d_un.d_ptr);
-                if(d->d_tag==DT_STRTAB) strtab=(const char*)(load_bias+d->d_un.d_ptr);
+        if(dyn2){
+            Elf64_Rela* rela=nullptr; size_t rela_sz=0;
+            Elf64_Sym*  sym2=nullptr; const char* str2=nullptr;
+            for(auto* d=dyn2;d->d_tag!=DT_NULL;d++){
+                if(d->d_tag==DT_JMPREL)   rela=(Elf64_Rela*)(load_bias+d->d_un.d_ptr);
+                if(d->d_tag==DT_PLTRELSZ) rela_sz=d->d_un.d_val/sizeof(Elf64_Rela);
+                if(d->d_tag==DT_SYMTAB)   sym2=(Elf64_Sym*)(load_bias+d->d_un.d_ptr);
+                if(d->d_tag==DT_STRTAB)   str2=(const char*)(load_bias+d->d_un.d_ptr);
             }
-            if(rela_plt&&symtab&&strtab){
-                for(size_t i=0;i<rela_plt_sz;i++){
-                    uint32_t sym_idx=ELF64_R_SYM(rela_plt[i].r_info);
-                    const char* name=strtab+symtab[sym_idx].st_name;
-                    if(strcmp(name,"eglSwapBuffers")==0){
-                        // GOT entry
-                        void** got=(void**)(load_bias+rela_plt[i].r_offset);
-                        LOGI("libunity GOT eglSwapBuffers: %p -> %p", got, *got);
-                        // Сохраняем оригинал из GOT
+            LOGI("GOT scan: rela=%p sz=%zu sym=%p str=%p", rela,(size_t)rela_sz,sym2,str2);
+            if(rela&&sym2&&str2&&rela_sz>0&&rela_sz<100000){
+                for(size_t i=0;i<rela_sz;i++){
+                    uint32_t si=ELF64_R_SYM(rela[i].r_info);
+                    if(sym2[si].st_name==0) continue;
+                    const char* nm=str2+sym2[si].st_name;
+                    if(strcmp(nm,"eglSwapBuffers")==0){
+                        void** got=(void**)(load_bias+rela[i].r_offset);
+                        LOGI("GOT entry found: %p -> %p", got, *got);
                         g_orig_swap=(fn_swap)*got;
-                        // Патчим GOT
-                        _a64_protect(got, PROT_READ|PROT_WRITE|PROT_EXEC);
+                        _a64_protect(got,PROT_READ|PROT_WRITE|PROT_EXEC);
                         *got=(void*)hook_swap;
-                        _a64_protect(got, PROT_READ|PROT_EXEC);
-                        LOGI("GOT patch done, orig=%p", g_orig_swap);
+                        _a64_protect(got,PROT_READ|PROT_EXEC);
+                        LOGI("GOT patched! orig=%p", g_orig_swap);
                         egl_hooked=true;
                         break;
                     }
