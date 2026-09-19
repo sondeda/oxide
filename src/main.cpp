@@ -29,6 +29,7 @@
 #include <atomic>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <vulkan/vulkan.h>
 #include "zygisk.hpp"
 #include "And64InlineHook.hpp"
 
@@ -840,7 +841,29 @@ static void check_menu_toggle() {
 // eglSwapBuffers hook
 // ─────────────────────────────────────────────────────────────────────────────
 using fn_eglSwap = EGLBoolean(*)(EGLDisplay, EGLSurface);
+using fn_vkPresent = VkResult(*)(VkQueue, const VkPresentInfoKHR*);
+static fn_vkPresent g_orig_vkPresent = nullptr;
+static bool g_using_vulkan = false;
 static fn_eglSwap g_orig_swap = nullptr;
+
+static VkResult hooked_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
+    static int vk_frame = 0;
+    vk_frame++;
+
+    if (vk_frame == 1) LOGI("Vulkan present hook firing!");
+
+    if (vk_frame >= 60) {
+        if (!g_gl_ready) {
+            // Vulkan path: нет OpenGL, используем Canvas overlay через /proc
+            // Просто логируем пока что
+            if (vk_frame == 60) LOGI("Vulkan renderer detected — GL ESP not available");
+            g_gl_ready = false; // останется false
+        }
+        if (vk_frame % 300 == 0) LOGI("vk_frame=%d players=%zu", vk_frame, g_players.size());
+    }
+
+    return g_orig_vkPresent(queue, pPresentInfo);
+}
 
 static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     // Инициализируем GL один раз с задержкой
@@ -957,7 +980,19 @@ static void install_hooks() {
         LOGE("libEGL.so dlopen failed");
     }
 
-    LOGI("all hooks installed");
+    // Пробуем Vulkan (Unity 6 на Android 16 использует Vulkan по умолчанию)
+    void* vk_lib = dlopen("libvulkan.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!vk_lib) vk_lib = dlopen("libvulkan.so", RTLD_LAZY);
+    if (vk_lib) {
+        void* vk_fn = dlsym(vk_lib, "vkQueuePresentKHR");
+        if (vk_fn) {
+            bool ok = A64HookFunction(vk_fn, (void*)hooked_vkQueuePresentKHR, (void**)&g_orig_vkPresent);
+            LOGI("vkQueuePresentKHR hook: %s", ok ? "OK" : "FAIL");
+            if (ok) g_using_vulkan = true;
+        }
+    }
+
+    LOGI("all hooks installed (vulkan=%d)", (int)g_using_vulkan);
 
     // запускаем тред чтения тачскрина
     std::thread(touch_reader_thread).detach();
