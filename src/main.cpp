@@ -147,6 +147,7 @@ static GLint  g_uloc_res = -1, g_uloc_col = -1;
 static GLint  g_aloc_pos = -1;
 static int    g_sw = 1080, g_sh = 1920;
 static bool   g_gl_ok = false;
+static int    g_anw_frame = 0;
 
 static const char* kVS =
     "attribute vec2 p;\nuniform vec2 r;\n"
@@ -625,7 +626,6 @@ static jint hook_RegisterNatives(JNIEnv* env, jclass cls,
 // ANativeWindow hook — вызывается каждый кадр независимо от рендерера
 using fn_ANW = int(*)(void*);
 static fn_ANW g_orig_ANW = nullptr;
-static int g_anw_frame = 0;
 
 static int hook_ANW(void* window) {
     g_anw_frame++;
