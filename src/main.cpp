@@ -378,12 +378,12 @@ static void check_toggle(){
 
 // ── EGL hook ──────────────────────────────────────────────────────────────────
 using fn_swap=EGLBoolean(*)(EGLDisplay,EGLSurface);
-using fn_vkpresent=VkResult(*)(VkQueue,const VkPresentInfoKHR*);
+using fn_vkpresent=int(*)(void*,const void*);
 static fn_vkpresent g_orig_vkpresent=nullptr;
 static fn_swap g_orig_swap=nullptr;
 static int g_frame=0;
 
-static VkResult hook_vkPresent(VkQueue q, const VkPresentInfoKHR* p){
+static int hook_vkPresent(void* q, const void* p){
     g_frame++;
     if(g_frame<=3) LOGI("VK PRESENT CALLED frame=%d",g_frame);
     if(g_frame%600==0) LOGI("vkframe=%d gl=%d",g_frame,(int)g_gl_ok);
@@ -425,7 +425,7 @@ static VkResult hook_vkPresent(VkQueue q, const VkPresentInfoKHR* p){
         if(g_aloc_pos>=0)glDisableVertexAttribArray((GLuint)g_aloc_pos);
     }
 
-    return g_orig_vkpresent(q,p);
+    return g_orig_vkpresent ? g_orig_vkpresent(q,p) : 0;
 }
 
 static EGLBoolean hook_swap(EGLDisplay dpy,EGLSurface surf){
