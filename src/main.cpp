@@ -636,12 +636,119 @@ static void install(){
 }
 
 // ── Zygisk ────────────────────────────────────────────────────────────────────
+static JavaVM* g_jvm = nullptr;
+
+// Android overlay thread — рисует поверх игры через Canvas
+static void overlay_thread() {
+    // Ждём пока игра запустится
+    sleep(8);
+    if(!g_jvm) { LOGE("no JVM"); return; }
+
+    JNIEnv* env = nullptr;
+    g_jvm->AttachCurrentThread(&env, nullptr);
+    if(!env) { LOGE("attach failed"); return; }
+
+    LOGI("overlay thread started");
+
+    // Получаем Activity через ActivityThread
+    jclass at_cls = env->FindClass("android/app/ActivityThread");
+    jmethodID cur = env->GetStaticMethodID(at_cls, "currentActivityThread",
+                    "()Landroid/app/ActivityThread;");
+    jobject at = env->CallStaticObjectMethod(at_cls, cur);
+    jmethodID getApp = env->GetMethodID(at_cls, "getApplication",
+                    "()Landroid/app/Application;");
+    jobject app = env->CallObjectMethod(at, getApp);
+    if(!app) { LOGE("no app context"); g_jvm->DetachCurrentThread(); return; }
+    LOGI("got app context");
+
+    // WindowManager для overlay
+    jclass ctx_cls = env->FindClass("android/content/Context");
+    jfieldID wm_field = env->GetStaticFieldID(ctx_cls, "WINDOW_SERVICE",
+                        "Ljava/lang/String;");
+    jobject wm_str = env->GetStaticObjectField(ctx_cls, wm_field);
+    jmethodID get_sys_svc = env->GetMethodID(ctx_cls, "getSystemService",
+                        "(Ljava/lang/String;)Ljava/lang/Object;");
+    jobject wm = env->CallObjectMethod(app, get_sys_svc, wm_str);
+    if(!wm) { LOGE("no WindowManager"); g_jvm->DetachCurrentThread(); return; }
+    LOGI("got WindowManager");
+
+    // Создаём TextView для отображения
+    jclass tv_cls = env->FindClass("android/widget/TextView");
+    jmethodID tv_init = env->GetMethodID(tv_cls, "<init>",
+                        "(Landroid/content/Context;)V");
+    jobject tv = env->NewObject(tv_cls, tv_init, app);
+
+    // Устанавливаем текст
+    jmethodID set_text = env->GetMethodID(tv_cls, "setText",
+                        "(Ljava/lang/CharSequence;)V");
+    jstring txt = env->NewStringUTF("BobaDLC External | by Lotusor");
+    env->CallVoidMethod(tv, set_text, txt);
+
+    // Цвет текста — красный
+    jmethodID set_color = env->GetMethodID(tv_cls, "setTextColor", "(I)V");
+    env->CallVoidMethod(tv, set_color, (jint)0xFFFF3333);
+
+    // Размер текста
+    jmethodID set_size = env->GetMethodID(tv_cls, "setTextSize", "(F)V");
+    env->CallVoidMethod(tv, set_size, (jfloat)14.0f);
+
+    // WindowManager.LayoutParams
+    jclass lp_cls = env->FindClass("android/view/WindowManager$LayoutParams");
+    jmethodID lp_init = env->GetMethodID(lp_cls, "<init>", "(IIIII)V");
+
+    // TYPE_APPLICATION_OVERLAY = 2038
+    // FLAG_NOT_FOCUSABLE = 8, FLAG_NOT_TOUCH_MODAL = 32
+    // PIXEL_FORMAT_TRANSLUCENT = -3
+    jobject lp = env->NewObject(lp_cls, lp_init,
+        (jint)200, (jint)50,   // width, height
+        (jint)2038,            // TYPE_APPLICATION_OVERLAY
+        (jint)(8|32),          // flags
+        (jint)-3               // format TRANSLUCENT
+    );
+
+    // Позиция — левый верхний угол
+    jfieldID grav_f = env->GetFieldID(lp_cls, "gravity", "I");
+    env->SetIntField(lp, grav_f, (jint)(0x30|0x03)); // TOP|LEFT
+
+    // addView
+    jclass wm_cls = env->FindClass("android/view/WindowManager");
+    jmethodID add_view = env->GetMethodID(wm_cls, "addView",
+                        "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
+    env->CallVoidMethod(wm, add_view, tv, lp);
+
+    if(env->ExceptionCheck()){
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        LOGE("overlay addView failed");
+        g_jvm->DetachCurrentThread();
+        return;
+    }
+    LOGI("OVERLAY ADDED SUCCESSFULLY");
+
+    // Обновляем текст каждую секунду
+    jstring prev_txt = txt;
+    while(true) {
+        sleep(1);
+        char buf[128];
+        size_t cnt = 0;
+        {std::lock_guard<std::mutex> lk(g_mtx); cnt=g_players.size();}
+        snprintf(buf,sizeof(buf),"BobaDLC External | Players: %zu | tap=menu",(size_t)cnt);
+        jstring new_txt = env->NewStringUTF(buf);
+        env->CallVoidMethod(tv, set_text, new_txt);
+        if(env->ExceptionCheck()){env->ExceptionClear();}
+        env->DeleteLocalRef(prev_txt);
+        prev_txt = new_txt;
+    }
+
+    g_jvm->DetachCurrentThread();
+}
+
 class LotusorModule : public zygisk::ModuleBase {
     zygisk::Api* api_=nullptr;
     JNIEnv* env_=nullptr;
     bool target_=false;
 public:
-    void onLoad(zygisk::Api* a,JNIEnv* e)override{api_=a;env_=e;}
+    void onLoad(zygisk::Api* a,JNIEnv* e)override{api_=a;env_=e;g_jvm=nullptr;e->GetJavaVM(&g_jvm);}
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args)override{
         if(!args||!args->nice_name){
@@ -658,6 +765,9 @@ public:
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs*)override{
         if(!target_)return;
+        // Запускаем overlay поток
+        std::thread(overlay_thread).detach();
+
         std::thread([](){
             LOGI("waiting for libil2cpp.so...");
             for(int i=0;i<600;i++){
