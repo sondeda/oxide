@@ -551,6 +551,77 @@ static void* elf_find_sym(uintptr_t base, const char* symname) {
     return nullptr;
 }
 
+// RegisterNatives hook — перехватываем регистрацию нативных методов Unity
+// Когда Unity регистрирует nativeInjectEvent — подменяем его на наш
+using fn_RegisterNatives = jint(*)(JNIEnv*, jclass, const JNINativeMethod*, jint);
+static fn_RegisterNatives g_orig_RegisterNatives = nullptr;
+static void* g_unity_render_fn = nullptr;
+
+// Наш render hook — вызывается вместо Unity nativeInjectEvent каждый кадр
+static void our_render_hook(JNIEnv* env, jobject obj, jlong l) {
+    g_anw_frame++;
+    if(g_anw_frame <= 3) LOGI("RENDER HIT via nativeInjectEvent frame=%d", g_anw_frame);
+
+    // Инициализируем GL
+    if(g_anw_frame == 10 && !g_gl_ok) {
+        EGLDisplay dpy = eglGetCurrentDisplay();
+        EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+        LOGI("EGL: dpy=%p surf=%p", (void*)dpy, (void*)surf);
+        if(dpy != EGL_NO_DISPLAY && surf != EGL_NO_SURFACE) {
+            EGLint w=0,h=0;
+            eglQuerySurface(dpy,surf,EGL_WIDTH,&w);
+            eglQuerySurface(dpy,surf,EGL_HEIGHT,&h);
+            if(w>100&&h>100){g_sw=w;g_sh=h;}
+            if(gl_init()) g_gl_ok=true;
+            LOGI("GL init %dx%d ok=%d",g_sw,g_sh,(int)g_gl_ok);
+        }
+    }
+
+    // Рисуем
+    if(g_gl_ok && g_anw_frame > 30) {
+        glUseProgram(g_prog);
+        glUniform2f(g_uloc_res,(float)g_sw,(float)g_sh);
+        GLboolean ob,od;
+        glGetBooleanv(GL_BLEND,&ob);
+        glGetBooleanv(GL_DEPTH_TEST,&od);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_DEPTH_TEST);
+        draw_watermark();
+        check_toggle();
+        draw_menu();
+        draw_esp();
+        if(!ob)glDisable(GL_BLEND);
+        if(od)glEnable(GL_DEPTH_TEST);
+        glUseProgram(0);
+        if(g_aloc_pos>=0)glDisableVertexAttribArray((GLuint)g_aloc_pos);
+    }
+
+    // Вызываем оригинал
+    if(g_unity_render_fn)
+        ((void(*)(JNIEnv*,jobject,jlong))g_unity_render_fn)(env,obj,l);
+}
+
+static jint hook_RegisterNatives(JNIEnv* env, jclass cls,
+                                  const JNINativeMethod* methods, jint count) {
+    for(jint i=0;i<count;i++) {
+        if(methods[i].name && strcmp(methods[i].name,"nativeInjectEvent")==0) {
+            LOGI("FOUND nativeInjectEvent sig=%s fn=%p",
+                 methods[i].signature, methods[i].fnPtr);
+            g_unity_render_fn = methods[i].fnPtr;
+            // Подменяем указатель на наш хук
+            const_cast<JNINativeMethod*>(methods)[i].fnPtr = (void*)our_render_hook;
+        }
+        if(methods[i].name && strcmp(methods[i].name,"nativeRender")==0) {
+            LOGI("FOUND nativeRender sig=%s fn=%p",
+                 methods[i].signature, methods[i].fnPtr);
+            g_unity_render_fn = methods[i].fnPtr;
+            const_cast<JNINativeMethod*>(methods)[i].fnPtr = (void*)our_render_hook;
+        }
+    }
+    return g_orig_RegisterNatives(env, cls, methods, count);
+}
+
 // ANativeWindow hook — вызывается каждый кадр независимо от рендерера
 using fn_ANW = int(*)(void*);
 static fn_ANW g_orig_ANW = nullptr;
@@ -603,21 +674,18 @@ static int hook_ANW(void* window) {
 
     // Всегда пишем данные в файл (для будущего APK или отладки)
     if(g_anw_frame % 30 == 0) {
-        FILE* f = fopen("/data/local/tmp/bobadlc_data.txt","w");
-        if(f) {
+        FILE* fout = fopen("/data/local/tmp/bobadlc_data.txt","w");
+        if(fout) {
             std::lock_guard<std::mutex> lk(g_mtx);
-            fprintf(f,"frame:%d
-players:%zu
-",g_anw_frame,g_players.size());
-            int i=0;
+            fprintf(fout,"frame:%d players:%zu\n",g_anw_frame,g_players.size());
+            int pi=0;
             for(void* pm : g_players) {
                 if(!pm||(uintptr_t)pm<0x1000) continue;
                 float hp=read_hp(pm);
                 std::string nm=read_name(pm);
-                fprintf(f,"p%d:%s:%.0f
-",i++,nm.c_str(),hp);
+                fprintf(fout,"p%d:%s:%.0f\n",pi++,nm.c_str(),hp);
             }
-            fclose(f);
+            fclose(fout);
         }
     }
 
@@ -631,19 +699,28 @@ static void install(){
     A64HookFunction(rva(RVA_PM_OnDis),    (void*)hook_OnDisable, (void**)&g_orig_dis);
     LOGI("PlayerManager hooks done");
 
-    // ANativeWindow_unlockAndPost — вызывается Unity каждый кадр
-    // независимо от Vulkan/OpenGL/рендерера
+    // Хукаем JNI_RegisterNatives — перехватываем регистрацию Unity нативных методов
+    void* libart = dlopen("libart.so", RTLD_LAZY | RTLD_NOLOAD);
+    if(!libart) libart = dlopen("libart.so", RTLD_LAZY);
+    if(libart) {
+        void* fn = dlsym(libart, "RegisterNatives");
+        if(!fn) fn = dlsym(libart, "_ZN3art3JNI15RegisterNativesEP7_JNIEnvP7_jclassPK15JNINativeMethodi");
+        LOGI("RegisterNatives in libart: %p", fn);
+        if(fn) {
+            bool ok = A64HookFunction(fn,(void*)hook_RegisterNatives,(void**)&g_orig_RegisterNatives);
+            LOGI("RegisterNatives hook: %s", ok?"OK":"FAIL");
+        }
+    }
+
+    // Fallback — ANativeWindow
     void* aw_lib = dlopen("libandroid.so", RTLD_LAZY | RTLD_NOLOAD);
     if(!aw_lib) aw_lib = dlopen("libandroid.so", RTLD_LAZY);
     if(aw_lib) {
         void* fn = dlsym(aw_lib, "ANativeWindow_unlockAndPost");
-        LOGI("ANativeWindow_unlockAndPost: %p", fn);
         if(fn) {
-            bool ok = A64HookFunction(fn, (void*)hook_ANW, (void**)&g_orig_ANW);
+            bool ok = A64HookFunction(fn,(void*)hook_ANW,(void**)&g_orig_ANW);
             LOGI("ANW hook: %s", ok?"OK":"FAIL");
         }
-    } else {
-        LOGE("libandroid.so not found");
     }
 
     LOGI("all hooks done");
