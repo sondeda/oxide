@@ -640,117 +640,97 @@ static JavaVM* g_jvm = nullptr;
 
 // Android overlay thread — рисует поверх игры через Canvas
 static void overlay_thread() {
-    // Ждём пока игра запустится
     sleep(8);
     if(!g_jvm) { LOGE("no JVM"); return; }
 
     JNIEnv* env = nullptr;
     g_jvm->AttachCurrentThread(&env, nullptr);
     if(!env) { LOGE("attach failed"); return; }
-
     LOGI("overlay thread started");
 
-    // Получаем Activity через ActivityThread
+    // Получаем Activity
     jclass at_cls = env->FindClass("android/app/ActivityThread");
-    jmethodID cur = env->GetStaticMethodID(at_cls, "currentActivityThread",
-                    "()Landroid/app/ActivityThread;");
-    jobject at = env->CallStaticObjectMethod(at_cls, cur);
-    jmethodID getApp = env->GetMethodID(at_cls, "getApplication",
-                    "()Landroid/app/Application;");
-    jobject app = env->CallObjectMethod(at, getApp);
-    if(!app) { LOGE("no app context"); g_jvm->DetachCurrentThread(); return; }
-    LOGI("got app context");
+    jobject at = env->CallStaticObjectMethod(at_cls,
+        env->GetStaticMethodID(at_cls,"currentActivityThread","()Landroid/app/ActivityThread;"));
+    jobject app = env->CallObjectMethod(at,
+        env->GetMethodID(at_cls,"getApplication","()Landroid/app/Application;"));
+    if(!app){ LOGE("no app"); g_jvm->DetachCurrentThread(); return; }
 
-    // WindowManager для overlay
-    jclass ctx_cls = env->FindClass("android/content/Context");
-    jfieldID wm_field = env->GetStaticFieldID(ctx_cls, "WINDOW_SERVICE",
-                        "Ljava/lang/String;");
-    jobject wm_str = env->GetStaticObjectField(ctx_cls, wm_field);
-    jmethodID get_sys_svc = env->GetMethodID(ctx_cls, "getSystemService",
-                        "(Ljava/lang/String;)Ljava/lang/Object;");
-    jobject wm = env->CallObjectMethod(app, get_sys_svc, wm_str);
-    if(!wm) { LOGE("no WindowManager"); g_jvm->DetachCurrentThread(); return; }
-    LOGI("got WindowManager");
+    // Получаем главный Looper и Handler
+    jclass looper_cls = env->FindClass("android/os/Looper");
+    jobject main_looper = env->CallStaticObjectMethod(looper_cls,
+        env->GetStaticMethodID(looper_cls,"getMainLooper","()Landroid/os/Looper;"));
 
-    // Создаём TextView для отображения
-    jclass tv_cls = env->FindClass("android/widget/TextView");
-    jmethodID tv_init = env->GetMethodID(tv_cls, "<init>",
-                        "(Landroid/content/Context;)V");
-    jobject tv = env->NewObject(tv_cls, tv_init, app);
+    jclass handler_cls = env->FindClass("android/os/Handler");
+    jobject handler = env->NewObject(handler_cls,
+        env->GetMethodID(handler_cls,"<init>","(Landroid/os/Looper;)V"),
+        main_looper);
+    LOGI("got handler=%p", handler);
 
-    // Устанавливаем текст
-    jmethodID set_text = env->GetMethodID(tv_cls, "setText",
-                        "(Ljava/lang/CharSequence;)V");
-    jstring txt = env->NewStringUTF("BobaDLC External | by Lotusor");
-    env->CallVoidMethod(tv, set_text, txt);
+    // Создаём Runnable через анонимный класс — используем reflection
+    // Проще: используем Handler.post(Runnable) через специальный класс
+    // Самый простой способ: вызвать Toast на UI thread как проверку
 
-    // Цвет текста — красный
-    jmethodID set_color = env->GetMethodID(tv_cls, "setTextColor", "(I)V");
-    env->CallVoidMethod(tv, set_color, (jint)0xFFFF3333);
+    // Toast.makeText(context, text, duration).show()
+    jclass toast_cls = env->FindClass("android/widget/Toast");
+    jmethodID make_toast = env->GetStaticMethodID(toast_cls, "makeText",
+        "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;");
 
-    // Размер текста
-    jmethodID set_size = env->GetMethodID(tv_cls, "setTextSize", "(F)V");
-    env->CallVoidMethod(tv, set_size, (jfloat)14.0f);
+    // Нам нужен UI thread для show(). Используем Handler.post через Runnable
+    // Создаём java.lang.Runnable через Proxy — сложно.
+    // Проще: используем Activity.runOnUiThread если можем получить Activity
 
-    // WindowManager.LayoutParams
-    jclass lp_cls = env->FindClass("android/view/WindowManager$LayoutParams");
-    jmethodID lp_init = env->GetMethodID(lp_cls, "<init>", "(IIIII)V");
+    // Получаем текущую Activity через ActivityThread.currentActivity()
+    jmethodID cur_act = env->GetMethodID(at_cls, "currentActivity",
+        "()Landroid/app/Activity;");
+    jobject activity = nullptr;
+    if(cur_act) {
+        activity = env->CallObjectMethod(at, cur_act);
+        if(env->ExceptionCheck()){ env->ExceptionClear(); activity=nullptr; }
+    }
+    LOGI("activity=%p", activity);
 
-    // TYPE_SYSTEM_OVERLAY = 2006 (работает с root без разрешения)
-    // FLAG_NOT_FOCUSABLE = 8, FLAG_NOT_TOUCH_MODAL = 32, FLAG_LAYOUT_IN_SCREEN = 256
-    // PIXEL_FORMAT_TRANSLUCENT = -3
-    jobject lp = env->NewObject(lp_cls, lp_init,
-        (jint)400, (jint)60,   // width, height
-        (jint)2006,            // TYPE_SYSTEM_OVERLAY
-        (jint)(8|32|256),      // flags
-        (jint)-3               // format TRANSLUCENT
-    );
-
-    // Позиция — левый верхний угол
-    jfieldID grav_f = env->GetFieldID(lp_cls, "gravity", "I");
-    env->SetIntField(lp, grav_f, (jint)(0x30|0x03)); // TOP|LEFT
-
-    // addView
-    jclass wm_cls = env->FindClass("android/view/WindowManager");
-    jmethodID add_view = env->GetMethodID(wm_cls, "addView",
-                        "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
-    env->CallVoidMethod(wm, add_view, tv, lp);
-
-    if(env->ExceptionCheck()){
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        LOGE("TYPE_SYSTEM_OVERLAY failed, trying TYPE_SYSTEM_ERROR=2010");
-        // Пробуем TYPE_SYSTEM_ERROR = 2010
-        jfieldID type_f = env->GetFieldID(lp_cls, "type", "I");
-        env->SetIntField(lp, type_f, (jint)2010);
-        env->CallVoidMethod(wm, add_view, tv, lp);
-        if(env->ExceptionCheck()){
-            env->ExceptionDescribe();
-            env->ExceptionClear();
-            LOGE("all overlay types failed");
-            g_jvm->DetachCurrentThread();
-            return;
+    if(!activity) {
+        // Ждём Activity
+        for(int i=0;i<30&&!activity;i++){
+            sleep(1);
+            if(cur_act){
+                activity=env->CallObjectMethod(at,cur_act);
+                if(env->ExceptionCheck()){env->ExceptionClear();activity=nullptr;}
+            }
         }
     }
-    LOGI("OVERLAY ADDED SUCCESSFULLY");
+    LOGI("activity after wait=%p", activity);
+    if(!activity){ LOGE("no activity"); g_jvm->DetachCurrentThread(); return; }
 
-    // Обновляем текст каждую секунду
-    jstring prev_txt = txt;
+    // Toast через runOnUiThread
+    // Создаём CharSequence
     while(true) {
-        sleep(1);
         char buf[128];
-        size_t cnt = 0;
+        size_t cnt=0;
         {std::lock_guard<std::mutex> lk(g_mtx); cnt=g_players.size();}
-        snprintf(buf,sizeof(buf),"BobaDLC External | Players: %zu | tap=menu",(size_t)cnt);
-        jstring new_txt = env->NewStringUTF(buf);
-        env->CallVoidMethod(tv, set_text, new_txt);
-        if(env->ExceptionCheck()){env->ExceptionClear();}
-        env->DeleteLocalRef(prev_txt);
-        prev_txt = new_txt;
+        snprintf(buf,sizeof(buf),"BobaDLC | Players:%zu",(size_t)cnt);
+        jstring jtxt = env->NewStringUTF(buf);
+
+        // Toast.makeText
+        jobject toast = env->CallStaticObjectMethod(toast_cls, make_toast,
+            app, jtxt, (jint)0); // LENGTH_SHORT=0
+        if(!env->ExceptionCheck() && toast) {
+            jmethodID show = env->GetMethodID(toast_cls,"show","()V");
+            env->CallVoidMethod(toast, show);
+            if(env->ExceptionCheck()){ env->ExceptionClear(); LOGE("toast show failed"); }
+            else LOGI("TOAST SHOWN: %s", buf);
+        } else {
+            env->ExceptionClear();
+            LOGE("toast make failed");
+        }
+        env->DeleteLocalRef(jtxt);
+        sleep(3); // показываем Toast каждые 3 секунды
     }
 
     g_jvm->DetachCurrentThread();
 }
+
 
 class LotusorModule : public zygisk::ModuleBase {
     zygisk::Api* api_=nullptr;
