@@ -696,13 +696,13 @@ static void overlay_thread() {
     jclass lp_cls = env->FindClass("android/view/WindowManager$LayoutParams");
     jmethodID lp_init = env->GetMethodID(lp_cls, "<init>", "(IIIII)V");
 
-    // TYPE_APPLICATION_OVERLAY = 2038
-    // FLAG_NOT_FOCUSABLE = 8, FLAG_NOT_TOUCH_MODAL = 32
+    // TYPE_SYSTEM_OVERLAY = 2006 (работает с root без разрешения)
+    // FLAG_NOT_FOCUSABLE = 8, FLAG_NOT_TOUCH_MODAL = 32, FLAG_LAYOUT_IN_SCREEN = 256
     // PIXEL_FORMAT_TRANSLUCENT = -3
     jobject lp = env->NewObject(lp_cls, lp_init,
-        (jint)200, (jint)50,   // width, height
-        (jint)2038,            // TYPE_APPLICATION_OVERLAY
-        (jint)(8|32),          // flags
+        (jint)400, (jint)60,   // width, height
+        (jint)2006,            // TYPE_SYSTEM_OVERLAY
+        (jint)(8|32|256),      // flags
         (jint)-3               // format TRANSLUCENT
     );
 
@@ -719,9 +719,18 @@ static void overlay_thread() {
     if(env->ExceptionCheck()){
         env->ExceptionDescribe();
         env->ExceptionClear();
-        LOGE("overlay addView failed");
-        g_jvm->DetachCurrentThread();
-        return;
+        LOGE("TYPE_SYSTEM_OVERLAY failed, trying TYPE_SYSTEM_ERROR=2010");
+        // Пробуем TYPE_SYSTEM_ERROR = 2010
+        jfieldID type_f = env->GetFieldID(lp_cls, "type", "I");
+        env->SetIntField(lp, type_f, (jint)2010);
+        env->CallVoidMethod(wm, add_view, tv, lp);
+        if(env->ExceptionCheck()){
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            LOGE("all overlay types failed");
+            g_jvm->DetachCurrentThread();
+            return;
+        }
     }
     LOGI("OVERLAY ADDED SUCCESSFULLY");
 
